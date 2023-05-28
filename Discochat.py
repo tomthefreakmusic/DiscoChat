@@ -11,11 +11,21 @@ from rake_nltk import Rake
 import tiktoken
 import traceback
 import atexit
+import nltk
+
+# Download nltk data
+nltk.download("stopwords")
+nltk.download("punkt")
 
 # Load and set environment variables from .env file
 load_dotenv()
 
-required_variables = ["DISCORD_TOKEN", "OPENAI_API_KEY"]
+required_variables = [
+    "DISCORD_TOKEN",
+    "OPENAI_API_KEY",
+    "BOT_NAME",
+    "DATABASE_DIRECTORY",
+]
 
 for variable in required_variables:
     if os.getenv(variable) is None:
@@ -27,16 +37,41 @@ TOKEN = os.getenv("DISCORD_TOKEN")
 # Set OpenAI API key, also set a seperate variable for chroma to use.
 openai.api_key = os.getenv("OPENAI_API_KEY")
 
-bot_name = "Discochat"
-recent_messages_length = 1000
-relevant_messages_length = 1000
-system_message = f"You are a helpful AI system named {bot_name}. You are a combination of a vector database (Chroma) and OpenAI's GPT 3.5 Turbo model, integrated into Discord. Recent messages are fetched from Discord, whereas relevant messages are fetched from the vector database. These messages are found in the first message from yourself, seperated by HTML-style formatting tags. It is important to take into consideration both recent messages and relevant messages in your response. Previously relevant messages are also in the first message. These are messages that were relevant to the prior response and may also be applicable."
-model = "gpt-3.5-turbo"
-max_response_tokens = 1000
-min_messages_threshold = 5
-previous_relevant_messages = {}
-max_discord_message_length = 2000
+# establishes the bot name. this is a string.
+if os.getenv("BOT_NAME") is None:
+    bot_name = "Discochat"
+else:
+    bot_name = os.getenv("BOT_NAME")
 
+# sets the database directory.
+if os.getenv("DATABASE_DIRECTORY") is None:
+    database_directory = "/database/"
+else:
+    database_directory = os.getenv("DATABASE_DIRECTORY")
+
+# sets the recent messages section of message history in token length.
+recent_messages_length = 1000
+
+# sets the relevant messages section of message history in token length.
+relevant_messages_length = 1000
+
+# sets the system message.
+system_message = f"You are a helpful AI system named {bot_name}. You are a combination of a vector database (Chroma) and OpenAI's GPT 3.5 Turbo model, integrated into Discord. Recent messages are fetched from Discord, whereas relevant messages are fetched from the vector database. These messages are found in the first message from yourself, seperated by HTML-style formatting tags. It is important to take into consideration both recent messages and relevant messages in your response. Previously relevant messages are also in the first message. These are messages that were relevant to the prior response and may also be applicable."
+
+# sets the model.
+model = "gpt-3.5-turbo"
+
+# sets the max response tokens.
+max_response_tokens = 1000
+
+# sets the minimum messages required to be stored before relevant messages can be retrieved.
+min_messages_threshold = 5
+
+# creates a ephemeral dictionary for storing the previous relevant messages, these are currently summarized before storage.
+previous_relevant_messages = {}
+
+# sets maximum message length (if you have nitro this could be increased)
+max_discord_message_length = 2000
 
 # Set discord intents
 intents = discord.Intents.default()
@@ -47,6 +82,7 @@ intents.message_content = True
 # Sets the client variable
 client = discord.Client(intents=intents)
 
+# Sets the token encoder to match the model we are using.
 token_encoder = tiktoken.encoding_for_model(model)
 
 # setup chroma and the collection (message_bank)
@@ -59,7 +95,7 @@ message_bank = chromadb_client.get_or_create_collection(
 )
 
 
-# Defines the store_document function, for storing the discord messages in the database.
+# Defines the store_document function, for storing the discord messages in the chroma database.
 def store_document(message):
     if message and message.content:
         message_id, content, metadata = extract_message_data(message)
@@ -92,8 +128,7 @@ def extract_message_data(message):
     content = message.clean_content  # This should be a string, not a list
     # if the content includes mention of bot, we need to remove the mention itself
 
-    if f"@{bot_name}" in content.lower():
-        content = content.replace(f"@{bot_name}", "")
+    if client.user in message.mentions:
         bot_mentioned = "True"
     else:
         bot_mentioned = "False"
@@ -101,7 +136,7 @@ def extract_message_data(message):
         server = "DM"
     else:
         server = str(message.guild)
-    if message.content.lower().startswith(f"!{bot_name}"):
+    if message.content.lower().startswith(f"!{bot_name.lower()}"):  # type: ignore
         is_command = "True"
     else:
         is_command = "False"
@@ -140,16 +175,17 @@ def retrieve_relevant_messages(message, token_length):
     if f"@{bot_name}" in query.lower():
         query = query.replace(f"@{bot_name}", "")
 
-    # print(query)
-    # sanity_check = message_bank.get(where=where_conditions) # type: ignore
-    # print(sanity_check)
     relevant_messages = message_bank.query(
         query_texts=query,
         n_results=25,
         where=where_conditions,  # type: ignore
     )
-    # now we should grab the relevant_messages dictionary, which is formatted as follows. the keys of this dictionary are ids, metadatas, documents and distances. the values of these keys are lists of size len(query) where query is a list. so if there is only one query, for each of the keys there is a list which features n_results within a list.
-    # so first we need to extract the lists and grab the first element of the list (as this will be the results, there won't be other elements as we have only passed one query text)
+
+    # now we should grab the relevant_messages dictionary, which is formatted as follows. the keys of this dictionary are ids, metadatas, documents and distances. 
+    # the values of these keys are lists of size len(query) where query is a list. 
+    # so if there is only one query, for each of the keys there is a list which features n_results within a list.
+    # so first we need to extract the lists and grab the first element of the list 
+    # (as this will be the results, there won't be other elements as we have only passed one query text)
     # then, we need to extract the individual elements of each list, and use this information to generate the final relevant messages output.
 
     ids = relevant_messages["ids"][0]
@@ -163,10 +199,12 @@ def retrieve_relevant_messages(message, token_length):
         if distance <= distance_threshold and distance >= 0.05:
             author = metadatas[i]["author"]
             document = documents[i]
-            #rounded_distance = round(distance, 2)
-            
+            # rounded_distance = round(distance, 2)
+
             temp_string = f"{author}: {document}, "
-            current_message_tokens = len(token_encoder.encode(result_string + temp_string))
+            current_message_tokens = len(
+                token_encoder.encode(result_string + temp_string)
+            )
 
             if current_message_tokens <= token_length:
                 result_string += temp_string
@@ -175,24 +213,26 @@ def retrieve_relevant_messages(message, token_length):
 
     result_string = result_string[:-2]
 
-    #print(f"{result_string} is of length {len(token_encoder.encode(result_string))}")
-    
-    store_retrieved_messages(message, result_string)
+    # print(f"{result_string} is of length {len(token_encoder.encode(result_string))}")
+
+    store_relevant_messages(message, result_string)
     return result_string
 
-def store_retrieved_messages(message, result_string):
+
+# Defines a function that stores
+def store_relevant_messages(message, result_string):
     channel = str(message.channel.id)
 
     messages = [
         {"role": "assistant", "content": f"summarize these messages: {result_string}"},
     ]
 
-    summary = chat_completion_create(
-                model, messages, max_response_tokens
-                )
+    summary = chat_completion_create(model, messages, max_response_tokens)
     summary = summary["choices"][0]["message"]["content"]  # type: ignore
     previous_relevant_messages[channel] = summary
-    
+
+
+# Defines a helper function that retrieves the strings from "previous_relevant_messages" for the channel and returns the string.
 def retrieve_previous_relevant_messages(message):
     channel = str(message.channel.id)
     if channel in previous_relevant_messages:
@@ -201,25 +241,14 @@ def retrieve_previous_relevant_messages(message):
     else:
         return ""
 
-# Defines a function that checks if the message is a DM.
+
+# Defines a helper function that checks if the message is a DM.
 def is_dm(message):
     is_dm = isinstance(message.channel, discord.DMChannel)
     return is_dm
 
 
-# Defines a function that checks if the message is a command, if it is, it runs the relevant function.
-async def handle_command(message):
-    if message.author == client.user:
-        return
-    else:
-        command = message.content[11:]
-        if command == "populate database":
-            await populate_database(message)
-        else:
-            await message.channel.send("Command not found")
-
-
-# Defines a function that fetches most recent messages from discord based on the bounds.
+# Defines a function that fetches most recent messages from discord based on the token length bounds.
 async def retrieve_recent_messages(message, token_length):
     # defines a list to store the history
     recent_messages = []
@@ -240,7 +269,6 @@ async def retrieve_recent_messages(message, token_length):
             f"[{timestamp}] {message.author.name}: {message.clean_content} "
         )
 
-
         current_message_tokens = len(token_encoder.encode(formatted_message))
         if token_length - current_message_tokens < 0:
             break
@@ -257,15 +285,7 @@ async def retrieve_recent_messages(message, token_length):
     return recent_messages
 
 
-# defines a function that prints a message to the console when the discord bot is ready
-async def on_ready():
-    print(f"{client.user} has connected to Discord!")
-    # Add a print statement to display connected servers
-    print(f"Connected servers: {', '.join([guild.name for guild in client.guilds])}")
-
-
 # in this function we are doing our initial populating of the database for the channel. this involves iterating through all prior messages,
-# adding their message IDs to the message_ids and storing the messages into the database.
 async def populate_database(message):
     # get the channel that the message was sent in
     async for message in message.channel.history(limit=500):
@@ -277,6 +297,7 @@ async def populate_database(message):
     return
 
 
+# defines a helper function for counting the messages in a channel.
 def channel_database_count(message):
     # Query the database for all documents where the channel matches the current channel.
     # As we are not interested in the documents themselves, we only retrieve the metadata.
@@ -289,6 +310,7 @@ def channel_database_count(message):
     return num_messages
 
 
+# defines a function for asynchronously handling chat completion
 async def async_chat_completion_create(
     model_for_completion, messages_for_completion, response_tokens
 ):
@@ -303,15 +325,46 @@ async def async_chat_completion_create(
     )
     return response
 
+
+# Defines a helper function that checks if the message is a command, if it is, it runs the relevant function.
+async def handle_command(message):
+    if message.author == client.user:
+        return
+    else:
+        command = message.content[11:]
+        if command == "populate database":
+            await populate_database(message)
+        else:
+            await message.channel.send("Command not found")
+
+
+# defines a function for handling chat completion that isn't asynchronous. this is useful for situations where we NEED the response before continuing. database handling etc.
 def chat_completion_create(
     model_for_completion, messages_for_completion, response_tokens
 ):
     response = openai.ChatCompletion.create(
-            model=model_for_completion,
-            messages=messages_for_completion,
-            max_tokens=response_tokens,
-        )
+        model=model_for_completion,
+        messages=messages_for_completion,
+        max_tokens=response_tokens,
+    )
     return response
+
+
+# defines a helper function that handles creation of the messages block of the chat completion.
+async def generate_completion_messages(message):
+    previous_relevant_messages = retrieve_previous_relevant_messages(message)
+    recent_messages = await retrieve_recent_messages(message, recent_messages_length)
+    relevant_messages = retrieve_relevant_messages(message, relevant_messages_length)
+    timestamp = str(message.created_at)[:-16]
+    assistant_message = f"I am responding to the user: {message.author}. If they have a preferred name, I'll call them by that. <recent messages> {recent_messages} </recent messages>, <recalled messages> {relevant_messages} </recalled messages> <previously recalled messages> {previous_relevant_messages} </previously recalled messages> The time is {timestamp}."
+    # print(assistant_message)
+    messages = [
+        {"role": "system", "content": system_message},
+        {"role": "assistant", "content": assistant_message},
+        {"role": "user", "content": f"{message.clean_content}"},
+    ]
+
+    return messages
 
 
 # defines a function that handles messages sent on discord that the bot can see.
@@ -320,7 +373,7 @@ async def on_message(message):
     try:
         # first we need to determine whether there is any commands in the message.
         # if there is, we need to handle them and return.
-        if message.content.lower().startswith(f"!{bot_name}"):
+        if message.content.lower().startswith(f"!{bot_name.lower()}"):  # type: ignore
             await handle_command(message)
         else:
             # Check if the message should be responded to
@@ -352,6 +405,7 @@ async def on_message(message):
         traceback.print_exc()
 
 
+# defines a helper function that handles messages bigger than discord handles by default (nitro makes this redundant)
 async def send_long_discord_message(message, response):
     if len(response) <= max_discord_message_length:
         await message.channel.send(response)
@@ -365,20 +419,11 @@ async def send_long_discord_message(message, response):
             await asyncio.sleep(1)
 
 
-async def generate_completion_messages(message):
-    previous_relevant_messages = retrieve_previous_relevant_messages(message)
-    recent_messages = await retrieve_recent_messages(message, recent_messages_length)
-    relevant_messages = retrieve_relevant_messages(message, relevant_messages_length)
-    timestamp = str(message.created_at)[:-16]
-    assistant_message = f"I am responding to the user: {message.author}. If they have a preferred name, I'll call them by that. <recent messages> {recent_messages} </recent messages>, <recalled messages> {relevant_messages} </recalled messages> <previously recalled messages> {previous_relevant_messages} </previously recalled messages> The time is {timestamp}."
-    #print(assistant_message)
-    messages = [
-        {"role": "system", "content": system_message},
-        {"role": "assistant", "content": assistant_message},
-        {"role": "user", "content": f"{message.clean_content}"},
-    ]
-
-    return messages
+# defines a function that prints a message to the console when the discord bot is ready
+async def on_ready():
+    print(f"{client.user} has connected to Discord!")
+    # Add a print statement to display connected servers
+    print(f"Connected servers: {', '.join([guild.name for guild in client.guilds])}")
 
 
 # Add the event handlers to the client
@@ -395,9 +440,11 @@ except ValueError as e:
     print(str(e))
 
 
+# defines a function that saves the chroma database to disk.
 def save_database():
     chromadb_client.persist()
     pass
 
 
+# saves the database on exit (workaround for https://github.com/chroma-core/chroma/issues/622)
 atexit.register(save_database)
