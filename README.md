@@ -22,7 +22,9 @@ Install the required Python packages:
 
     openai, discord.py, chromadb, dotenv, rake-nltk, tiktoken, asyncio, atexit
 
-Setup a .env file in your project root with your Discord token and OpenAI API key:
+Setup a discord bot via https://discord.com/developers/applications. The bot must have permissions to: read messages/view channels, send messages and read message history.
+
+Setup a .env file in your project root with your Discord bot token and OpenAI API key:
 
     DISCORD_TOKEN=your_discord_token
     OPENAI_API_KEY=your_openai_key
