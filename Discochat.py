@@ -64,7 +64,7 @@ recent_messages_length = 1000
 relevant_messages_length = 1000
 
 # sets the system message.
-system_message = f"You are a helpful AI system named {bot_name}. You are a combination of a vector database (Chroma) and OpenAI's GPT 3.5 Turbo model, integrated into Discord. Recent messages are fetched from Discord, whereas relevant messages are fetched from the vector database. These messages are found in the first message from yourself, seperated by HTML-style formatting tags. It is important to take into consideration both recent messages and relevant messages in your response."
+system_message = f"You are a helpful AI system named {bot_name}. You are system that combines a vector database (Chroma) and OpenAI's GPT 3.5 Turbo model, integrated into Discord. You respond when mentioned by a user. Users message you within Discord. Recent messages within the channel are fetched from Discord, whereas relevant messages from the channel are fetched from the vector database. Avoid repeating what the user says, be concise and conversational."
 
 # sets the model.
 model = "gpt-3.5-turbo"
@@ -421,12 +421,12 @@ async def generate_completion_messages(message):
     #previous_relevant_messages = retrieve_previous_relevant_messages(message)
     recent_messages = await retrieve_recent_messages(message, recent_messages_length)
     timestamp = str(message.created_at)[:-16]
-    assistant_message = f"I am responding to the user: {message.author.name}. If they have a preferred name, I'll call them by that. <recent messages> {recent_messages} </recent messages>, <recalled messages> {relevant_messages} </recalled messages> The time is {timestamp}."
+    assistant_message = f"I am planning a response to {message.author.name}'s upcoming message. I will first take in contextual information so that I can respond appropriately. These are the recent messages in this discord channel: {recent_messages}. These are retrieved messages from the message database that may be relevant to the conversation: {relevant_messages}. The current time is {timestamp}. With this information taken into account, I will respond to {message.author.name} appropriately."
     # print(assistant_message)
     messages = [
         {"role": "system", "content": system_message},
         {"role": "assistant", "content": assistant_message},
-        {"role": "user", "content": f"{message.clean_content}"},
+        {"role": "user", "content": f"{message.clean_content}"},     
     ]
 
     return messages
