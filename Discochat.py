@@ -25,6 +25,7 @@ required_variables = [
     "OPENAI_API_KEY",
     "BOT_NAME",
     "DATABASE_DIRECTORY",
+    "DEV_NAME",
 ]
 
 for variable in required_variables:
@@ -42,6 +43,12 @@ if os.getenv("BOT_NAME") is None:
     bot_name = "Discochat"
 else:
     bot_name = os.getenv("BOT_NAME")
+
+# sets the developer name. this is a string.
+if os.getenv("DEVNAME") is None:
+    dev_name = ""
+else:
+    dev_name = os.getenv("DEVNAME")
 
 # sets the database directory.
 if os.getenv("DATABASE_DIRECTORY") is None:
@@ -218,6 +225,62 @@ def retrieve_relevant_messages(message, token_length):
     store_relevant_messages(message, result_string)
     return result_string
 
+# Defines a alternative function that queries the database based on the query contents and bounds.
+async def alt_retrieve_relevant_messages(message, token_length):
+    query = message.clean_content
+    channel = str(message.channel.id)
+    distance_threshold = 0.4
+
+    # Set the where conditions to only search in the channel
+
+    where_conditions = {"$and": [{"channel": channel}, {"is_command": "False"}]}
+
+    relevant_messages = message_bank.query(
+        query_texts=query,
+        n_results=5,
+        where=where_conditions,  # type: ignore
+    )
+
+    # now we should grab the relevant_messages dictionary, which is formatted as follows. the keys of this dictionary are ids, metadatas, documents and distances. 
+    # the values of these keys are lists of size len(query) where query is a list. 
+    # so if there is only one query, for each of the keys there is a list which features n_results within a list.
+    # so first we need to extract the lists and grab the first element of the list 
+    # (as this will be the results, there won't be other elements as we have only passed one query text)
+    # then, we need to extract the individual elements of each list, and use this information to generate the final relevant messages output.
+
+    ids = relevant_messages["ids"][0]
+    documents = relevant_messages["documents"][0]  # type: ignore
+    metadatas = relevant_messages["metadatas"][0]  # type: ignore
+    distances = relevant_messages["distances"][0]  # type: ignore
+
+    result_string = ""
+    for i in range(len(ids)):
+        distance = distances[i]
+        if distance <= distance_threshold and distance >= 0.05:
+            author = metadatas[i]["author"]
+            created_at = metadatas[i]["created_at"]
+            document = documents[i]
+            # rounded_distance = round(distance, 2)
+            near_messages = [message async for message in message.channel.history(limit=5, around=created_at, oldest_first=True)]
+            for message in near_messages:
+
+                temp_string = f"{str(message.created_at)[:-16]} {message.author.name}: {message.clean_content}, "
+                current_message_tokens = len(
+                token_encoder.encode(result_string + temp_string)
+                )
+
+                if current_message_tokens <= token_length:
+                    result_string += temp_string
+                else:
+                    break  # If adding next message would exceed token limit, break the loop
+
+    result_string = result_string[:-2]
+
+    # print(f"{result_string} is of length {len(token_encoder.encode(result_string))}")
+
+    store_relevant_messages(message, result_string)
+    return result_string
+
 
 # Defines a function that stores
 def store_relevant_messages(message, result_string):
@@ -352,9 +415,12 @@ def chat_completion_create(
 
 # defines a helper function that handles creation of the messages block of the chat completion.
 async def generate_completion_messages(message):
+    if message.author.name == dev_name:
+        relevant_messages = alt_retrieve_relevant_messages(message, relevant_messages_length)
+    else:
+        relevant_messages = retrieve_relevant_messages(message, relevant_messages_length)
     previous_relevant_messages = retrieve_previous_relevant_messages(message)
     recent_messages = await retrieve_recent_messages(message, recent_messages_length)
-    relevant_messages = retrieve_relevant_messages(message, relevant_messages_length)
     timestamp = str(message.created_at)[:-16]
     assistant_message = f"I am responding to the user: {message.author}. If they have a preferred name, I'll call them by that. <recent messages> {recent_messages} </recent messages>, <recalled messages> {relevant_messages} </recalled messages> <previously recalled messages> {previous_relevant_messages} </previously recalled messages> The time is {timestamp}."
     # print(assistant_message)
@@ -364,7 +430,7 @@ async def generate_completion_messages(message):
         {"role": "user", "content": f"{message.clean_content}"},
     ]
 
-    return messages
+    return messages, relevant_messages
 
 
 # defines a function that handles messages sent on discord that the bot can see.
@@ -383,7 +449,7 @@ async def on_message(message):
             # If the message should be responded to, send a response
             if should_respond:
                 # fetch and organise the messages for chat completion.
-                messages = await generate_completion_messages(message)
+                messages, alt_relevant_messages = await generate_completion_messages(message)
 
                 # Send the messages to the OpenAI API
                 response = await async_chat_completion_create(
@@ -398,7 +464,10 @@ async def on_message(message):
             else:
                 # print("Message not responded to.")
                 pass
-
+        
+        # print the alt_relevant_messages to the console if the message author is the dev.
+        if message.author == dev_name:
+            print(alt_relevant_messages) # type: ignore
     # If an error occurs, print it to the console.
     except Exception:
         # print(f"Error occurred: {e} \n")
