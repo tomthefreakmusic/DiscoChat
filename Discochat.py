@@ -158,6 +158,7 @@ def extract_message_data(message):
     keywords_str = ", ".join(keywords)
 
     metadata = {
+        "message_id": message_id,
         "channel": str(message.channel.id),
         "server": server,
         "author": author,
@@ -188,13 +189,6 @@ def retrieve_relevant_messages(message, token_length):
         n_results=25,
         where=where_conditions,  # type: ignore
     )
-
-    # now we should grab the relevant_messages dictionary, which is formatted as follows. the keys of this dictionary are ids, metadatas, documents and distances. 
-    # the values of these keys are lists of size len(query) where query is a list. 
-    # so if there is only one query, for each of the keys there is a list which features n_results within a list.
-    # so first we need to extract the lists and grab the first element of the list 
-    # (as this will be the results, there won't be other elements as we have only passed one query text)
-    # then, we need to extract the individual elements of each list, and use this information to generate the final relevant messages output.
 
     ids = relevant_messages["ids"][0]
     documents = relevant_messages["documents"][0]  # type: ignore
@@ -227,54 +221,73 @@ def retrieve_relevant_messages(message, token_length):
     return result_string
 
 
-# Defines a alternative function that queries the database based on the query contents and bounds.
-async def alt_retrieve_relevant_messages(message, token_length):
+async def alt_retrieve_relevant_messages(message, token_length, recent_message_ids):
     query = message.clean_content
     channel = str(message.channel.id)
-    distance_threshold = 0.7
+    distance_threshold = 0.8
+    bot_penalty = 0.1  # Adjust this to control how much bot messages are penalized
+
+    # Split the query into sentences
+    sentences = nltk.tokenize.sent_tokenize(query)
 
     # Set the where conditions to only search in the channel
     where_conditions = {"$and": [{"channel": channel}, {"is_command": "False"}]}
 
     relevant_messages = message_bank.query(
-        query_texts=query,
-        n_results=5,
+        query_texts=sentences,
+        n_results=1,
         where=where_conditions,  # type: ignore
     )
 
-    ids = relevant_messages["ids"][0]
-    documents = relevant_messages["documents"][0]  # type: ignore
-    metadatas = relevant_messages["metadatas"][0]  # type: ignore
-    distances = relevant_messages["distances"][0]  # type: ignore
-
     result_string = ""
-    for i in range(len(ids)):
-        distance = distances[i]
-        if distance <= distance_threshold and distance >= 0.00:
-            author = metadatas[i]["author"]
-            document = documents[i]
-            message_id = ids[i]  # Discord message ID is stored in ids
-            
-            # Fetch message object by id
-            message_around = await message.channel.fetch_message(message_id)
-            near_messages = [msg async for msg in message.channel.history(limit=5, around=message_around, oldest_first=True)]
-            
-            for msg in near_messages:
-                temp_string = f"{str(msg.created_at)[:-16]} {msg.author.name}: {msg.clean_content}, "
-                current_message_tokens = len(
-                token_encoder.encode(result_string + temp_string)
-                )
+    seen_messages = set()
 
-                if current_message_tokens <= token_length:
-                    result_string += temp_string
-                else:
-                    break  # If adding next message would exceed token limit, break the loop
+    for i in range(len(sentences)):
+        ids = relevant_messages["ids"][i]
+        documents = relevant_messages["documents"][i]  # type: ignore
+        metadatas = relevant_messages["metadatas"][i]  # type: ignore
+        distances = relevant_messages["distances"][i]  # type: ignore
+
+        # print(f"\nQuery Sentence: {sentences[i]}")
+
+        for j in range(len(ids)):
+            if ids[j] in seen_messages or ids[j] in recent_message_ids:
+                continue
+
+            seen_messages.add(ids[j])
+            
+            distance = distances[j]
+            if metadatas[j]["author"] == bot_name:
+                distance += bot_penalty  # Increase distance for bot messages
+
+            if distance <= distance_threshold:
+                message_id = ids[j]  # Discord message ID is stored in ids
+                
+                # Fetch message object by id
+                message_around = await message.channel.fetch_message(message_id)
+                near_messages = [msg async for msg in message.channel.history(limit=5, around=message_around, oldest_first=True)]
+                
+                for msg in near_messages:
+                    if msg.id in seen_messages or msg.id in recent_message_ids:
+                        continue
+
+                    seen_messages.add(msg.id)
+
+                    temp_string = f"{str(msg.created_at)[:-16]} {msg.author.name}: {msg.clean_content}, "
+                    current_message_tokens = len(
+                    token_encoder.encode(result_string + temp_string)
+                    )
+
+                    if current_message_tokens <= token_length:
+                        result_string += temp_string
+                        # print(f"Retrieved Message: {temp_string}")
+                    else:
+                        break  # If adding next message would exceed token limit, break the loop
 
     result_string = result_string[:-2]
 
     # print(f"{result_string} is of length {len(token_encoder.encode(result_string))}")
 
-    store_relevant_messages(message, result_string)
     return result_string
 
 
@@ -311,6 +324,7 @@ def is_dm(message):
 async def retrieve_recent_messages(message, token_length):
     # defines a list to store the history
     recent_messages = []
+    recent_message_ids = [message.id]
 
     message_number = 0
     async for message in message.channel.history(limit=11):
@@ -319,8 +333,6 @@ async def retrieve_recent_messages(message, token_length):
             continue
         message_number += 1
 
-        # format messages with username and message content, and a timestamp for the earliest message.
-        # !!! i need to make sure that timestamp is applied to earliest message regardless of whether we get to 21 messages.
         # for timestamp, we want to strip it back to a useful format
         timestamp = str(message.created_at)[:-16]
 
@@ -334,14 +346,14 @@ async def retrieve_recent_messages(message, token_length):
 
         # append formatted message to history
         recent_messages.append(formatted_message)
-
+        recent_message_ids.append(message.id)
         token_length -= current_message_tokens
 
     # reverse the history list so that the messages are in chronological order.
     recent_messages.reverse()
     # print(recent_messages)
     # returns the recent messages from the channel upto the length requested.
-    return recent_messages
+    return recent_messages, recent_message_ids
 
 
 # in this function we are doing our initial populating of the database for the channel. this involves iterating through all prior messages,
@@ -411,24 +423,24 @@ def chat_completion_create(
 
 # defines a helper function that handles creation of the messages block of the chat completion.
 async def generate_completion_messages(message):
-    if message.author.name == dev_name:
-        print("dev name detected, generating alt relevant messages")
-        relevant_messages = await alt_retrieve_relevant_messages(message, relevant_messages_length)
-        print(relevant_messages)
-    else:
-        relevant_messages = retrieve_relevant_messages(message, relevant_messages_length)
+    recent_messages, recent_message_ids = await retrieve_recent_messages(message, recent_messages_length)
 
-    #previous_relevant_messages = retrieve_previous_relevant_messages(message)
-    recent_messages = await retrieve_recent_messages(message, recent_messages_length)
+    # if message.author.name == dev_name:
+    #     print("dev name detected, generating alt relevant messages")
+    #     relevant_messages = await alt_retrieve_relevant_messages(message, relevant_messages_length, recent_message_ids)
+    #     print(relevant_messages)
+    # else:
+    relevant_messages = alt_retrieve_relevant_messages(message, relevant_messages_length, recent_message_ids)
+
     timestamp = str(message.created_at)[:-16]
-    assistant_message = f"I am responding to the user: {message.author.name}. If they have a preferred name, I'll call them by that. <recent messages> {recent_messages} </recent messages>, <recalled messages> {relevant_messages} </recalled messages> The time is {timestamp}."
-    # print(assistant_message)
+    assistant_message = f"I am responding to the user: {message.author.name}. <recent messages> {recent_messages} </recent messages>, <recalled messages> {relevant_messages} </recalled messages> The time is {timestamp}."
+    print(f"The user said: {message.clean_content}")
     messages = [
         {"role": "system", "content": system_message},
         {"role": "assistant", "content": assistant_message},
         {"role": "user", "content": f"{message.clean_content}"},
     ]
-
+    print("end of assistant context message.")
     return messages
 
 
