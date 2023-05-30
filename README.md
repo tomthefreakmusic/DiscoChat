@@ -31,7 +31,7 @@ Setup a .env file in your project root with your Discord bot token and OpenAI AP
 
 Then run the script using Python 3.8 or later.
 
-    python main.py
+    python Discochat.py
 
 ### Commands
 
