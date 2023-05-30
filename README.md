@@ -4,7 +4,7 @@
 ### Introduction
 DiscoChat is a Discord bot that leverages OpenAI's API to interact with users, and integrates a vector database, ChromaDB, to maintain and retrieve relevant historical context for enhanced chat completions. It fetches recent and relevant messages from Discord and the ChromaDB respectively, and uses them to generate context-aware responses.
 
-The bot can be interacted with by mentioning it. In Direct Messages (DMs), the bot responds to all messages. I have setup a test server on Discord, feel free to join and try out the latest version of the bot (codenamed Athena) (https://discord.gg/u2Qw4QfG)
+The bot can be interacted with by mentioning it. In Direct Messages (DMs), the bot responds to all messages.
 
 ### Features
 
