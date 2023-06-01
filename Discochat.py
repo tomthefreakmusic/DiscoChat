@@ -66,22 +66,22 @@ else:
     database_directory = os.getenv("DATABASE_DIRECTORY")
 
 # sets the recent messages section of message history in token length.
-recent_messages_length = 1000
+recent_messages_length = 750
 
 # sets the relevant messages section of message history in token length.
 relevant_messages_length = 1000
 
 # sets the system message.
-system_message = f"You are a helpful AI system named {bot_name}. You are a combination of a vector database (Chroma) and OpenAI's GPT 3.5 Turbo model, integrated into Discord. Recent messages are fetched from Discord, whereas relevant messages are fetched from the vector database. These messages are found in the first message from yourself, seperated by HTML-style formatting tags. It is important to take into consideration both recent messages and relevant messages in your response."
+system_message = f"You are the AI system named {bot_name}. You are a combination of a vector database (Chroma) and OpenAI's GPT 3.5 Turbo model, integrated into Discord. Recent messages are fetched from Discord, whereas relevant messages are fetched from the vector database. These messages are found in the first message from yourself, seperated by HTML-style formatting tags. It is important to take into consideration both recent messages and relevant messages in your response."
 
 # sets the model.
 model = "gpt-3.5-turbo"
 
 # sets the chat completion variables.
-max_response_tokens = 1000
-temperature = 1.2
-frequency_penalty = 0.2
-presence_penalty = 0.2
+max_response_tokens = 1500
+temperature = 1.1
+frequency_penalty = 0.3
+presence_penalty = 0.3
 
 # sets the minimum messages required to be stored before relevant messages can be retrieved.
 min_messages_threshold = 5
@@ -409,7 +409,7 @@ async def generate_completion_messages(message):
     relevant_messages = await retrieve_relevant_messages(message, relevant_messages_length, recent_message_ids)
     timestamp = str(message.created_at)[:-16]
 
-    assistant_message = f"I am responding to the user: {message.author.name}. <recent messages> {recent_messages} </recent messages>, <recalled messages> {relevant_messages} </recalled messages> The time is {timestamp}."
+    assistant_message = f"I am talking to the user: {message.author.name}. <recent messages> {recent_messages} </recent messages>, <recalled messages> {relevant_messages} </recalled messages> The time is {timestamp}."
     messages = [
         {"role": "system", "content": system_message},
         {"role": "assistant", "content": assistant_message},
