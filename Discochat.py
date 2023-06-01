@@ -27,6 +27,7 @@ required_variables = [
     "BOT_NAME",
     "DATABASE_DIRECTORY",
     "DEV_NAME",
+    "SERVER_WHITELIST"
 ]
 
 for variable in required_variables:
@@ -50,6 +51,13 @@ if os.getenv("DEV_NAME") is None:
     dev_name = ""
 else:
     dev_name = os.getenv("DEV_NAME")
+
+# sets the server whitelist. this is a string.
+if os.getenv("SERVER_WHITELIST") is None:
+    server_whitelist = []
+else:
+    server_whitelist = os.getenv("SERVER_WHITELIST")
+
 
 # sets the database directory.
 if os.getenv("DATABASE_DIRECTORY") is None:
@@ -239,7 +247,7 @@ async def retrieve_relevant_messages(message, token_length, recent_message_ids):
 
     result_string = result_string[:-2]
 
-    print(f"{result_string} is of length {len(token_encoder.encode(result_string))}")
+    #print(f"{result_string} is of length {len(token_encoder.encode(result_string))}")
 
     return result_string
 
@@ -309,6 +317,7 @@ async def retrieve_recent_messages(message, token_length):
     return recent_messages, recent_message_ids
 
 
+
 # in this function we are doing our initial populating of the database for the channel. this involves iterating through all prior messages,
 async def populate_database(message):
     # get the channel that the message was sent in
@@ -332,6 +341,21 @@ def channel_database_count(message):
     num_messages = len(channel_messages["ids"])
 
     return num_messages
+
+def check_permissions(message):
+    # check if the user has the required role to use the bot, {bot_name} being the role name.
+    # if the user is in a whitelisted server, we don't need to check for roles.
+    # if the user is messaging in DMs, we don't need to check for roles.
+    if is_dm(message):
+        return True
+    if message.guild.name in server_whitelist:
+        return True
+    else:
+        # iterate through the roles of the user, checking if they have the required role.
+        for role in message.author.roles:
+            if role.name == bot_name:
+                return True
+        return False
 
 
 
@@ -400,44 +424,47 @@ async def generate_completion_messages(message):
 
 # defines a function that handles messages sent on discord that the bot can see.
 async def on_message(message):
-    
-    store_document(message)
-    try:
-        # first we need to determine whether there is any commands in the message.
-        # if there is, we need to handle them and return.
-        if message.content.lower().startswith(f"!{bot_name.lower()}"):  # type: ignore
-            await handle_command(message)
-        else:
-            # Check if the message should be responded to
-            should_respond = (
-                client.user in message.mentions and message.author != client.user
-            ) or (is_dm(message) and message.author != client.user)
-            # If the message should be responded to, send a response
-            if should_respond:
-                # fetch and organise the messages for chat completion.
-                messages = await generate_completion_messages(message)
-                
-
-                # Send the messages to the OpenAI API
-                response = await async_chat_completion_create(
-                    model, messages, max_response_tokens
-                )
-                response = response["choices"][0]["message"]["content"]  # type: ignore
-
-                # Send the response to the channel
-                await send_long_discord_message(message, response)
-
-                # print("Message was responded to.")
+    # First we'll check roles, if the user doesn't have the required role, we'll return.
+    if check_permissions(message) == True:
+        store_document(message)
+        try:
+            # first we need to determine whether there is any commands in the message.
+            # if there is, we need to handle them and return.
+            if message.content.lower().startswith(f"!{bot_name.lower()}"):  # type: ignore
+                await handle_command(message)
             else:
-                # print("Message not responded to.")
-                pass
-        
-        # print the alt_relevant_messages to the console if the message author is the dev.
-        
-    # If an error occurs, print it to the console.
-    except Exception:
-        # print(f"Error occurred: {e} \n")
-        traceback.print_exc()
+                # Check if the message should be responded to
+                should_respond = (
+                    client.user in message.mentions and message.author != client.user
+                ) or (is_dm(message) and message.author != client.user)
+                # If the message should be responded to, send a response
+                if should_respond:
+                    # fetch and organise the messages for chat completion.
+                    messages = await generate_completion_messages(message)
+                    
+
+                    # Send the messages to the OpenAI API
+                    response = await async_chat_completion_create(
+                        model, messages, max_response_tokens
+                    )
+                    response = response["choices"][0]["message"]["content"]  # type: ignore
+
+                    # Send the response to the channel
+                    await send_long_discord_message(message, response)
+
+                    # print("Message was responded to.")
+                else:
+                    # print("Message not responded to.")
+                    pass
+            
+            # print the alt_relevant_messages to the console if the message author is the dev.
+            
+        # If an error occurs, print it to the console.
+        except Exception:
+            # print(f"Error occurred: {e} \n")
+            traceback.print_exc()
+    else:
+        pass
 
 
 # defines a helper function that handles messages bigger than discord handles by default (nitro makes this redundant)
