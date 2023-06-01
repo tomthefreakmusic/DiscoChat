@@ -386,15 +386,15 @@ async def generate_completion_messages(message):
     timestamp = str(message.created_at)[:-16]
 
     assistant_message = f"I am responding to the user: {message.author.name}. <recent messages> {recent_messages} </recent messages>, <recalled messages> {relevant_messages} </recalled messages> The time is {timestamp}."
-    print(f"The user said: {message.clean_content}")
     messages = [
         {"role": "system", "content": system_message},
         {"role": "assistant", "content": assistant_message},
         {"role": "user", "content": f"{message.clean_content}"},
     ]
-    print("start of assistant context message.")
-    print(assistant_message)
-    print("end of assistant context message.")
+    #print(f"The user said: {message.clean_content}")
+    #print("start of assistant context message.")
+    #print(assistant_message)
+    #print("end of assistant context message.")
     return messages
 
 
