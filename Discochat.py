@@ -69,8 +69,11 @@ system_message = f"You are a helpful AI system named {bot_name}. You are a combi
 # sets the model.
 model = "gpt-3.5-turbo"
 
-# sets the max response tokens.
+# sets the chat completion variables.
 max_response_tokens = 1000
+temperature = 1.2
+frequency_penalty = 0.2
+presence_penalty = 0.2
 
 # sets the minimum messages required to be stored before relevant messages can be retrieved.
 min_messages_threshold = 5
@@ -171,57 +174,7 @@ def extract_message_data(message):
     return message_id, content, metadata
 
 
-# Defines a function that queries the database based on the query contents and bounds.
-def retrieve_relevant_messages(message, token_length):
-    query = message.clean_content
-    channel = str(message.channel.id)
-    distance_threshold = 0.6
-
-    # Set the where conditions to only search in the channel
-
-    where_conditions = {"$and": [{"channel": channel}, {"is_command": "False"}]}
-
-    if f"@{bot_name}" in query.lower():
-        query = query.replace(f"@{bot_name}", "")
-
-    relevant_messages = message_bank.query(
-        query_texts=query,
-        n_results=25,
-        where=where_conditions,  # type: ignore
-    )
-
-    ids = relevant_messages["ids"][0]
-    documents = relevant_messages["documents"][0]  # type: ignore
-    metadatas = relevant_messages["metadatas"][0]  # type: ignore
-    distances = relevant_messages["distances"][0]  # type: ignore
-
-    result_string = ""
-    for i in range(len(ids)):
-        distance = distances[i]
-        if distance <= distance_threshold and distance >= 0.05:
-            author = metadatas[i]["author"]
-            document = documents[i]
-            # rounded_distance = round(distance, 2)
-
-            temp_string = f"{author}: {document}, "
-            current_message_tokens = len(
-                token_encoder.encode(result_string + temp_string)
-            )
-
-            if current_message_tokens <= token_length:
-                result_string += temp_string
-            else:
-                break  # If adding next message would exceed token limit, break the loop
-
-    result_string = result_string[:-2]
-
-    # print(f"{result_string} is of length {len(token_encoder.encode(result_string))}")
-
-    store_relevant_messages(message, result_string)
-    return result_string
-
-
-async def alt_retrieve_relevant_messages(message, token_length, recent_message_ids):
+async def retrieve_relevant_messages(message, token_length, recent_message_ids):
     query = message.clean_content
     channel = str(message.channel.id)
     distance_threshold = 0.8
@@ -235,7 +188,7 @@ async def alt_retrieve_relevant_messages(message, token_length, recent_message_i
 
     relevant_messages = message_bank.query(
         query_texts=sentences,
-        n_results=1,
+        n_results=2,
         where=where_conditions,  # type: ignore
     )
 
@@ -265,7 +218,7 @@ async def alt_retrieve_relevant_messages(message, token_length, recent_message_i
                 
                 # Fetch message object by id
                 message_around = await message.channel.fetch_message(message_id)
-                near_messages = [msg async for msg in message.channel.history(limit=5, around=message_around, oldest_first=True)]
+                near_messages = [msg async for msg in message.channel.history(limit=3, around=message_around, oldest_first=True)]
                 
                 for msg in near_messages:
                     if msg.id in seen_messages or msg.id in recent_message_ids:
@@ -273,7 +226,7 @@ async def alt_retrieve_relevant_messages(message, token_length, recent_message_i
 
                     seen_messages.add(msg.id)
 
-                    temp_string = f"{str(msg.created_at)[:-16]} {msg.author.name}: {msg.clean_content}, "
+                    temp_string = f"[{str(msg.created_at)[:-16]}] {msg.author.name}: {msg.clean_content}, "
                     current_message_tokens = len(
                     token_encoder.encode(result_string + temp_string)
                     )
@@ -286,7 +239,7 @@ async def alt_retrieve_relevant_messages(message, token_length, recent_message_i
 
     result_string = result_string[:-2]
 
-    # print(f"{result_string} is of length {len(token_encoder.encode(result_string))}")
+    print(f"{result_string} is of length {len(token_encoder.encode(result_string))}")
 
     return result_string
 
@@ -296,7 +249,7 @@ def store_relevant_messages(message, result_string):
     channel = str(message.channel.id)
 
     messages = [
-        {"role": "assistant", "content": f"summarize these messages: {result_string}"},
+        {"role": "user", "content": f"summarize these messages: {result_string}"},
     ]
 
     summary = chat_completion_create(model, messages, max_response_tokens)
@@ -381,21 +334,6 @@ def channel_database_count(message):
     return num_messages
 
 
-# defines a function for asynchronously handling chat completion
-async def async_chat_completion_create(
-    model_for_completion, messages_for_completion, response_tokens
-):
-    loop = asyncio.get_event_loop()
-    response = await loop.run_in_executor(
-        None,
-        lambda: openai.ChatCompletion.create(
-            model=model_for_completion,
-            messages=messages_for_completion,
-            max_tokens=response_tokens,
-        ),
-    )
-    return response
-
 
 # Defines a helper function that checks if the message is a command, if it is, it runs the relevant function.
 async def handle_command(message):
@@ -421,18 +359,32 @@ def chat_completion_create(
     return response
 
 
+# defines a function for asynchronously handling chat completion
+async def async_chat_completion_create(
+    model_for_completion, messages_for_completion, response_tokens
+):
+    loop = asyncio.get_event_loop()
+    response = await loop.run_in_executor(
+        None,
+        lambda: openai.ChatCompletion.create(
+            model=model_for_completion,
+            messages=messages_for_completion,
+            max_tokens=response_tokens,
+            temperature=temperature,
+            presence_penalty=presence_penalty,
+            frequency_penalty=frequency_penalty,
+        ),
+    )
+    return response
+
+
 # defines a helper function that handles creation of the messages block of the chat completion.
 async def generate_completion_messages(message):
+
     recent_messages, recent_message_ids = await retrieve_recent_messages(message, recent_messages_length)
-
-    # if message.author.name == dev_name:
-    #     print("dev name detected, generating alt relevant messages")
-    #     relevant_messages = await alt_retrieve_relevant_messages(message, relevant_messages_length, recent_message_ids)
-    #     print(relevant_messages)
-    # else:
-    relevant_messages = alt_retrieve_relevant_messages(message, relevant_messages_length, recent_message_ids)
-
+    relevant_messages = await retrieve_relevant_messages(message, relevant_messages_length, recent_message_ids)
     timestamp = str(message.created_at)[:-16]
+
     assistant_message = f"I am responding to the user: {message.author.name}. <recent messages> {recent_messages} </recent messages>, <recalled messages> {relevant_messages} </recalled messages> The time is {timestamp}."
     print(f"The user said: {message.clean_content}")
     messages = [
@@ -440,6 +392,8 @@ async def generate_completion_messages(message):
         {"role": "assistant", "content": assistant_message},
         {"role": "user", "content": f"{message.clean_content}"},
     ]
+    print("start of assistant context message.")
+    print(assistant_message)
     print("end of assistant context message.")
     return messages
 
