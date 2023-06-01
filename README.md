@@ -10,6 +10,7 @@ The bot can be interacted with by mentioning it. In Direct Messages (DMs), the b
 
 - Uses the GPT-3.5-Turbo model for chat completions, this can easily be reconfigured for GPT 4 if you have API access.
 - Uses ChromaDB for vector database message storage and retrival.
+- Users can opt-in to the system via a discord role, or the server can globally enable functionality via the enviroment variable server_whitelist.
 - Treats all channels and direct messages as seperate histories. Messages from one channel can not access messages from others, although this can be configured with minimal alterations.
 - Can handle long responses that exceed Discord's max message length.
 - Extracts and stores metadata (such as server, channel, author, timestamp, keywords, etc.) along with messages for relevance-based message retrieval.
@@ -28,6 +29,7 @@ Setup a .env file in your project root with your Discord bot token and OpenAI AP
     OPENAI_API_KEY=your_openai_key
     BOT_NAME=your_bot_name
     DATABASE_DIRECTORY=where_you_want_the_database_stored
+    SERVER_WHITELIST=your_server_name_if_you_want_all_users_to_have_access
 
 Then run the script using Python 3.8 or later.
 
