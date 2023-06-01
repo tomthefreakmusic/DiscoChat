@@ -54,7 +54,7 @@ else:
 
 # sets the server whitelist. this is a string.
 if os.getenv("SERVER_WHITELIST") is None:
-    server_whitelist = ""
+    server_whitelist = []
 else:
     server_whitelist = os.getenv("SERVER_WHITELIST")
 
@@ -247,7 +247,7 @@ async def retrieve_relevant_messages(message, token_length, recent_message_ids):
 
     result_string = result_string[:-2]
 
-    print(f"{result_string} is of length {len(token_encoder.encode(result_string))}")
+    #print(f"{result_string} is of length {len(token_encoder.encode(result_string))}")
 
     return result_string
 
@@ -425,7 +425,7 @@ async def generate_completion_messages(message):
 # defines a function that handles messages sent on discord that the bot can see.
 async def on_message(message):
     # First we'll check roles, if the user doesn't have the required role, we'll return.
-    if not check_permissions(message):
+    if check_permissions(message) == True:
         store_document(message)
         try:
             # first we need to determine whether there is any commands in the message.
