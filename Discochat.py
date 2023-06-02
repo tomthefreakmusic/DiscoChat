@@ -1,4 +1,5 @@
 # import relevant modules
+import random
 import openai
 import discord
 import os
@@ -66,22 +67,22 @@ else:
     database_directory = os.getenv("DATABASE_DIRECTORY")
 
 # sets the recent messages section of message history in token length.
-recent_messages_length = 1000
+recent_messages_length = 750
 
 # sets the relevant messages section of message history in token length.
 relevant_messages_length = 1000
 
 # sets the system message.
-system_message = f"You are a helpful AI system named {bot_name}. You are a combination of a vector database (Chroma) and OpenAI's GPT 3.5 Turbo model, integrated into Discord. Recent messages are fetched from Discord, whereas relevant messages are fetched from the vector database. These messages are found in the first message from yourself, seperated by HTML-style formatting tags. It is important to take into consideration both recent messages and relevant messages in your response."
+system_message = f"You are the AI system named {bot_name}. You are a combination of a vector database (Chroma) and OpenAI's GPT 3.5 Turbo model, integrated into Discord. Recent messages are fetched from Discord, whereas relevant messages are fetched from the vector database. These messages are found in the first message from yourself, seperated by HTML-style formatting tags. It is important to take into consideration both recent messages and relevant messages in your response."
 
 # sets the model.
 model = "gpt-3.5-turbo"
 
 # sets the chat completion variables.
-max_response_tokens = 1000
-temperature = 1.2
-frequency_penalty = 0.2
-presence_penalty = 0.2
+max_response_tokens = 1500
+temperature = 1.1
+frequency_penalty = 0.3
+presence_penalty = 0.3
 
 # sets the minimum messages required to be stored before relevant messages can be retrieved.
 min_messages_threshold = 5
@@ -103,6 +104,9 @@ client = discord.Client(intents=intents)
 
 # Sets the token encoder to match the model we are using.
 token_encoder = tiktoken.encoding_for_model(model)
+
+# Initialize Rake
+r = Rake()
 
 # setup chroma and the collection (message_bank)
 chromadb_client = chromadb.Client(
@@ -161,9 +165,8 @@ def extract_message_data(message):
         is_command = "False"
 
         # Extracts keywords from the message content.
-    r = Rake()
-    r.extract_keywords_from_text(message.clean_content)
-    keywords = r.get_ranked_phrases()[0:5]
+    
+    keywords = get_keywords(message.clean_content)
 
     # Convert keywords list to a single string
     keywords_str = ", ".join(keywords)
@@ -180,6 +183,10 @@ def extract_message_data(message):
     }
 
     return message_id, content, metadata
+
+def get_keywords(text, num_keywords=5):
+    r.extract_keywords_from_text(text)
+    return r.get_ranked_phrases()[0:num_keywords]
 
 
 async def retrieve_relevant_messages(message, token_length, recent_message_ids):
@@ -200,7 +207,9 @@ async def retrieve_relevant_messages(message, token_length, recent_message_ids):
         where=where_conditions,  # type: ignore
     )
 
-    result_string = ""
+    relevant_messages_result = ""
+    relevant_message_content = ""
+
     seen_messages = set()
 
     for i in range(len(sentences)):
@@ -235,21 +244,24 @@ async def retrieve_relevant_messages(message, token_length, recent_message_ids):
                     seen_messages.add(msg.id)
 
                     temp_string = f"[{str(msg.created_at)[:-16]}] {msg.author.name}: {msg.clean_content}, "
+                    content_string = f"{msg.clean_content}, "
                     current_message_tokens = len(
-                    token_encoder.encode(result_string + temp_string)
+                    token_encoder.encode(relevant_messages_result + temp_string)
                     )
 
                     if current_message_tokens <= token_length:
-                        result_string += temp_string
+                        relevant_messages_result += temp_string
+                        relevant_message_content += content_string
                         # print(f"Retrieved Message: {temp_string}")
                     else:
                         break  # If adding next message would exceed token limit, break the loop
 
-    result_string = result_string[:-2]
+    relevant_messages_result = relevant_messages_result[:-2]
+    relevant_message_content = relevant_message_content[:-2]
 
     #print(f"{result_string} is of length {len(token_encoder.encode(result_string))}")
 
-    return result_string
+    return relevant_messages_result, get_keywords(relevant_message_content, 10)
 
 
 # Defines a function that stores relevant messages in a dictionary.
@@ -286,6 +298,7 @@ async def retrieve_recent_messages(message, token_length):
     # defines a list to store the history
     recent_messages = []
     recent_message_ids = [message.id]
+    recent_message_content = ""
 
     message_number = 0
     async for message in message.channel.history(limit=11):
@@ -308,13 +321,14 @@ async def retrieve_recent_messages(message, token_length):
         # append formatted message to history
         recent_messages.append(formatted_message)
         recent_message_ids.append(message.id)
+        recent_message_content += message.clean_content + " "
         token_length -= current_message_tokens
 
     # reverse the history list so that the messages are in chronological order.
     recent_messages.reverse()
     # print(recent_messages)
     # returns the recent messages from the channel upto the length requested.
-    return recent_messages, recent_message_ids
+    return recent_messages, recent_message_ids, get_keywords(recent_message_content, 5)
 
 
 
@@ -355,6 +369,9 @@ def check_permissions(message):
         for role in message.author.roles:
             if role.name == bot_name:
                 return True
+        # if the user is the bot then we don't need to check for roles.
+        if message.author == client.user:
+            return True
         return False
 
 
@@ -369,6 +386,27 @@ async def handle_command(message):
             await populate_database(message)
         else:
             await message.channel.send("Command not found")
+
+def construct_logit_bias(keywords, bias_value, limit=10):
+    logit_bias = {}
+    if not keywords:
+        return logit_bias
+    if len(keywords) > limit:  # If keywords list exceeds limit, select a random subset
+        keywords = random.sample(keywords, limit)
+    for keyword in keywords:
+        if ' ' in keyword:
+            # Split the phrase into words
+            words = keyword.split(' ')
+            for word in words:
+                # Convert each word to a token ID
+                token_id = token_encoder.encode(word)[0]
+                logit_bias[token_id] = bias_value
+    else: 
+        # Convert keyword to token ID
+        token_id = token_encoder.encode(keyword)[0]
+        logit_bias[token_id] = bias_value
+
+    return logit_bias
 
 
 # defines a function for handling chat completion that isn't asynchronous. this is useful for situations where we NEED the response before continuing. database handling etc.
@@ -385,7 +423,7 @@ def chat_completion_create(
 
 # defines a function for asynchronously handling chat completion
 async def async_chat_completion_create(
-    model_for_completion, messages_for_completion, response_tokens
+    model_for_completion, messages_for_completion, logit_bias, response_tokens
 ):
     loop = asyncio.get_event_loop()
     response = await loop.run_in_executor(
@@ -397,6 +435,7 @@ async def async_chat_completion_create(
             temperature=temperature,
             presence_penalty=presence_penalty,
             frequency_penalty=frequency_penalty,
+            logit_bias=logit_bias,
         ),
     )
     return response
@@ -405,21 +444,27 @@ async def async_chat_completion_create(
 # defines a helper function that handles creation of the messages block of the chat completion.
 async def generate_completion_messages(message):
 
-    recent_messages, recent_message_ids = await retrieve_recent_messages(message, recent_messages_length)
-    relevant_messages = await retrieve_relevant_messages(message, relevant_messages_length, recent_message_ids)
+    recent_messages, recent_message_ids, recent_message_keywords = await retrieve_recent_messages(message, recent_messages_length)
+    relevant_messages, relevant_messages_keywords = await retrieve_relevant_messages(message, relevant_messages_length, recent_message_ids)
     timestamp = str(message.created_at)[:-16]
 
-    assistant_message = f"I am responding to the user: {message.author.name}. <recent messages> {recent_messages} </recent messages>, <recalled messages> {relevant_messages} </recalled messages> The time is {timestamp}."
+    assistant_message = f"I am talking to the user: {message.author.name}. <recent messages> {recent_messages} </recent messages>, <recalled messages> {relevant_messages} </recalled messages> The time is {timestamp}."
     messages = [
         {"role": "system", "content": system_message},
         {"role": "assistant", "content": assistant_message},
         {"role": "user", "content": f"{message.clean_content}"},
     ]
+    # now we will constructg the logit bias for the assistant and user messages.
+    # we will use the keywords from both messages to construct the logit bias.
+
+    logit_bias = {**construct_logit_bias(recent_message_keywords, -5), **construct_logit_bias(relevant_messages_keywords, 5)}
+    print(logit_bias)
+    
     #print(f"The user said: {message.clean_content}")
     #print("start of assistant context message.")
     #print(assistant_message)
     #print("end of assistant context message.")
-    return messages
+    return messages, logit_bias
 
 
 # defines a function that handles messages sent on discord that the bot can see.
@@ -440,12 +485,12 @@ async def on_message(message):
                 # If the message should be responded to, send a response
                 if should_respond:
                     # fetch and organise the messages for chat completion.
-                    messages = await generate_completion_messages(message)
+                    messages, logit_bias = await generate_completion_messages(message)
                     
 
                     # Send the messages to the OpenAI API
                     response = await async_chat_completion_create(
-                        model, messages, max_response_tokens
+                        model, messages, logit_bias, max_response_tokens
                     )
                     response = response["choices"][0]["message"]["content"]  # type: ignore
 
