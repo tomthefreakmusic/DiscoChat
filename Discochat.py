@@ -70,19 +70,26 @@ else:
 recent_messages_length = 750
 
 # sets the relevant messages section of message history in token length.
-relevant_messages_length = 1000
+relevant_messages_length = 500
 
 # sets the system message.
-system_message = f"You are the AI system named {bot_name}. You are a combination of a vector database (Chroma) and OpenAI's GPT 3.5 Turbo model, integrated into Discord. Recent messages are fetched from Discord, whereas relevant messages are fetched from the vector database. These messages are found in the first message from yourself, seperated by HTML-style formatting tags. It is important to take into consideration both recent messages and relevant messages in your response."
+system_message = f'''You are the AI system named {bot_name}. 
+You are a combination of a vector database (Chroma) and OpenAI's GPT 3.5 Turbo model, integrated into Discord. 
+Recent messages are fetched from Discord, whereas relevant messages are fetched from the vector database. 
+These messages are found in the first message from yourself, seperated by HTML-style formatting tags. 
+It is important to take into consideration both recent messages and relevant messages in your response. 
+If the user refers to you, they are refering to the {bot_name} system, not the language model that powers your responses.
+The user is familiar with language models and understand how they work so you do not provide basic explanations.
+The user understands that you are a language model and the limitations that come alongside that.'''
 
 # sets the model.
 model = "gpt-3.5-turbo"
 
 # sets the chat completion variables.
-max_response_tokens = 1500
+max_response_tokens = 1000
 temperature = 1.1
-frequency_penalty = 0.3
-presence_penalty = 0.3
+frequency_penalty = 0.8
+presence_penalty = 0.0
 
 # sets the minimum messages required to be stored before relevant messages can be retrieved.
 min_messages_threshold = 5
@@ -118,8 +125,8 @@ message_bank = chromadb_client.get_or_create_collection(
 )
 
 
-# Defines the store_document function, for storing the discord messages in the chroma database.
-def store_document(message):
+# Defines the store_message function, for storing the discord messages in the chroma database.
+def store_message(message):
     if message and message.content:
         message_id, content, metadata = extract_message_data(message)
 
@@ -190,29 +197,30 @@ def get_keywords(text, num_keywords=5):
 
 
 async def retrieve_relevant_messages(message, token_length, recent_message_ids):
-    query = message.clean_content
+    query = []
+    # get keywords from message.clean_content, add these to the query list
+    query.extend(message.clean_content)
     channel = str(message.channel.id)
-    distance_threshold = 0.8
-    bot_penalty = 0.1  # Adjust this to control how much bot messages are penalized
+    distance_threshold = 0.7
+    bot_penalty = 0.4  # Adjust this to control how much bot messages are penalized
 
     # Split the query into sentences
-    sentences = nltk.tokenize.sent_tokenize(query)
+    #sentences = nltk.tokenize.sent_tokenize(query)
 
     # Set the where conditions to only search in the channel
     where_conditions = {"$and": [{"channel": channel}, {"is_command": "False"}]}
 
     relevant_messages = message_bank.query(
-        query_texts=sentences,
-        n_results=2,
+        query_texts=query,
+        n_results=5,
         where=where_conditions,  # type: ignore
     )
 
     relevant_messages_result = ""
-    relevant_message_content = ""
 
     seen_messages = set()
 
-    for i in range(len(sentences)):
+    for i in range(len(query)):
         ids = relevant_messages["ids"][i]
         documents = relevant_messages["documents"][i]  # type: ignore
         metadatas = relevant_messages["metadatas"][i]  # type: ignore
@@ -241,45 +249,62 @@ async def retrieve_relevant_messages(message, token_length, recent_message_ids):
                     if msg.id in seen_messages or msg.id in recent_message_ids:
                         continue
 
+                    # we are going to split the message into words, and if any word is longer than 28 characters, we will truncate the word to that limit and add a "..." to the end
+                    # this is to prevent the model from crashing due to too many tokens
+                    message_content = msg.clean_content
+
+                    for word in message_content.split():
+                        if len(word) > 28:
+                            message_content = message_content.replace(word, word[:28] + "...")
+
                     seen_messages.add(msg.id)
 
-                    temp_string = f"[{str(msg.created_at)[:-16]}] {msg.author.name}: {msg.clean_content}, "
-                    content_string = f"{msg.clean_content}, "
+                    temp_string = f"[{str(msg.created_at)[:-16]}] {msg.author.name}: {message_content}, "
                     current_message_tokens = len(
                     token_encoder.encode(relevant_messages_result + temp_string)
                     )
 
                     if current_message_tokens <= token_length:
                         relevant_messages_result += temp_string
-                        relevant_message_content += content_string
-                        # print(f"Retrieved Message: {temp_string}")
+
                     else:
                         break  # If adding next message would exceed token limit, break the loop
 
     relevant_messages_result = relevant_messages_result[:-2]
-    relevant_message_content = relevant_message_content[:-2]
+
 
     #print(f"{result_string} is of length {len(token_encoder.encode(result_string))}")
 
-    return relevant_messages_result, get_keywords(relevant_message_content, 10)
+    return relevant_messages_result
 
 
 # Defines a function that stores relevant messages in a dictionary.
-def store_relevant_messages(message, result_string):
-    channel = str(message.channel.id)
+def summarize(input_text, summary_length=500):
 
     messages = [
-        {"role": "user", "content": f"summarize these messages: {result_string}"},
+        {"role": "user", "content": f"summarize these messages: {input_text}"},
     ]
 
-    summary = chat_completion_create(model, messages, max_response_tokens)
+    summary = chat_completion_create(model, messages, summary_length)
     summary = summary["choices"][0]["message"]["content"]  # type: ignore
-    previous_relevant_messages[channel] = summary
+    return summary
+
+# Defines a function that stores relevant messages in a dictionary.
+def summarize_for_context(recent_messages, relevant_messages, summary_length=500):
+
+    messages = [
+        {"role": "user", "content": f"summarize the recalled messages based on what is relevant to the conversation in recent messages. \
+        <recalled messages> {relevant_messages} </recalled messages> <recent messages> {recent_messages} </recent messages>."},
+    ]
+
+    summary = chat_completion_create(model, messages, summary_length)
+    summary = summary["choices"][0]["message"]["content"]  # type: ignore
+    return summary
 
 
 # Defines a helper function that retrieves the strings from "previous_relevant_messages" for the channel and returns the string.
 def retrieve_previous_relevant_messages(message):
-    channel = str(message.channel.id)
+    channel = message.channel.id
     if channel in previous_relevant_messages:
         result_string = previous_relevant_messages[channel]
         return result_string
@@ -301,7 +326,7 @@ async def retrieve_recent_messages(message, token_length):
     recent_message_content = ""
 
     message_number = 0
-    async for message in message.channel.history(limit=11):
+    async for message in message.channel.history(limit=21):
         if message_number == 0:
             message_number += 1
             continue
@@ -310,8 +335,13 @@ async def retrieve_recent_messages(message, token_length):
         # for timestamp, we want to strip it back to a useful format
         timestamp = str(message.created_at)[:-16]
 
+        message_content = message.clean_content
+        for word in message_content.split():
+                        if len(word) > 28:
+                            message_content = message_content.replace(word, word[:28] + "...")
+
         formatted_message = (
-            f"[{timestamp}] {message.author.name}: {message.clean_content} "
+            f"[{timestamp}] {message.author.name}: {message_content} "
         )
 
         current_message_tokens = len(token_encoder.encode(formatted_message))
@@ -321,14 +351,17 @@ async def retrieve_recent_messages(message, token_length):
         # append formatted message to history
         recent_messages.append(formatted_message)
         recent_message_ids.append(message.id)
-        recent_message_content += message.clean_content + " "
+
+        # filter out bot messages, as we only want user message keywords.
+        #if message.author != client.user:
+        #    recent_message_content += message.clean_content + " "
         token_length -= current_message_tokens
 
     # reverse the history list so that the messages are in chronological order.
     recent_messages.reverse()
     # print(recent_messages)
     # returns the recent messages from the channel upto the length requested.
-    return recent_messages, recent_message_ids, get_keywords(recent_message_content, 5)
+    return recent_messages, recent_message_ids, #get_keywords(recent_message_content, 5)
 
 
 
@@ -336,13 +369,19 @@ async def retrieve_recent_messages(message, token_length):
 async def populate_database(message):
     # get the channel that the message was sent in
     async for message in message.channel.history(limit=500):
-        store_document(message)
+        store_message(message)
     await message.channel.send(
         f"Database populated. There are {channel_database_count(message)} messages stored from this channel."
     )
     # print(message_bank.get(where={'channel': str(message.channel.id)}))
     return
 
+async def clear_database(message):
+    message_bank.delete(where={"channel": str(message.channel.id)})
+    await message.channel.send(
+        f"Database cleared. There are {channel_database_count(message)} messages stored from this channel."
+    )
+    return
 
 # defines a helper function for counting the messages in a channel.
 def channel_database_count(message):
@@ -384,6 +423,12 @@ async def handle_command(message):
         command = message.content[11:]
         if command == "populate database":
             await populate_database(message)
+        elif command == "count database":
+            await message.channel.send(
+                f"There are {channel_database_count(message)} messages stored from this channel."
+            )
+        elif command == "clear database":
+            await clear_database(message)
         else:
             await message.channel.send("Command not found")
 
@@ -403,7 +448,7 @@ def construct_logit_bias(keywords, bias_value, limit=10):
                 logit_bias[token_id] = bias_value
     else: 
         # Convert keyword to token ID
-        token_id = token_encoder.encode(keyword)[0]
+        token_id = token_encoder.encode(keyword)[0] #type: ignore
         logit_bias[token_id] = bias_value
 
     return logit_bias
@@ -423,7 +468,7 @@ def chat_completion_create(
 
 # defines a function for asynchronously handling chat completion
 async def async_chat_completion_create(
-    model_for_completion, messages_for_completion, logit_bias, response_tokens
+    model_for_completion, messages_for_completion, response_tokens
 ):
     loop = asyncio.get_event_loop()
     response = await loop.run_in_executor(
@@ -435,7 +480,6 @@ async def async_chat_completion_create(
             temperature=temperature,
             presence_penalty=presence_penalty,
             frequency_penalty=frequency_penalty,
-            logit_bias=logit_bias,
         ),
     )
     return response
@@ -443,35 +487,32 @@ async def async_chat_completion_create(
 
 # defines a helper function that handles creation of the messages block of the chat completion.
 async def generate_completion_messages(message):
-
-    recent_messages, recent_message_ids, recent_message_keywords = await retrieve_recent_messages(message, recent_messages_length)
-    relevant_messages, relevant_messages_keywords = await retrieve_relevant_messages(message, relevant_messages_length, recent_message_ids)
+    recent_messages, recent_message_ids = await retrieve_recent_messages(message, recent_messages_length)
+    relevant_messages = await retrieve_relevant_messages(message, relevant_messages_length, recent_message_ids)
+    prior_summary = retrieve_previous_relevant_messages(message)
+    # we will summarize the messages and store them in the dictionary previously_relevant_messages as the value for the channel ID key.
+    
     timestamp = str(message.created_at)[:-16]
 
-    assistant_message = f"I am talking to the user: {message.author.name}. <recent messages> {recent_messages} </recent messages>, <recalled messages> {relevant_messages} </recalled messages> The time is {timestamp}."
+    if prior_summary != "":
+        prior_summary = f"<previously relevant messages> {prior_summary} </previously relevant messages>"
+
+    assistant_message = f"I am talking to the user: {message.author.name}.<recent messages>{recent_messages}</recent messages><recalled messages> {relevant_messages}</recalled messages>{prior_summary} The time is {timestamp}."
+    print(assistant_message)
     messages = [
         {"role": "system", "content": system_message},
         {"role": "assistant", "content": assistant_message},
         {"role": "user", "content": f"{message.clean_content}"},
     ]
-    # now we will constructg the logit bias for the assistant and user messages.
-    # we will use the keywords from both messages to construct the logit bias.
 
-    logit_bias = {**construct_logit_bias(recent_message_keywords, -5), **construct_logit_bias(relevant_messages_keywords, 5)}
-    print(logit_bias)
-    
-    #print(f"The user said: {message.clean_content}")
-    #print("start of assistant context message.")
-    #print(assistant_message)
-    #print("end of assistant context message.")
-    return messages, logit_bias
+    return messages, recent_messages, relevant_messages
 
 
 # defines a function that handles messages sent on discord that the bot can see.
 async def on_message(message):
     # First we'll check roles, if the user doesn't have the required role, we'll return.
     if check_permissions(message) == True:
-        store_document(message)
+        store_message(message)
         try:
             # first we need to determine whether there is any commands in the message.
             # if there is, we need to handle them and return.
@@ -484,19 +525,22 @@ async def on_message(message):
                 ) or (is_dm(message) and message.author != client.user)
                 # If the message should be responded to, send a response
                 if should_respond:
+                    async with message.channel.typing():
                     # fetch and organise the messages for chat completion.
-                    messages, logit_bias = await generate_completion_messages(message)
+                        messages, recent_messages, relevant_messages = await generate_completion_messages(message)
                     
-
                     # Send the messages to the OpenAI API
-                    response = await async_chat_completion_create(
-                        model, messages, logit_bias, max_response_tokens
-                    )
-                    response = response["choices"][0]["message"]["content"]  # type: ignore
+                        response = await async_chat_completion_create(
+                            model, messages, max_response_tokens
+                        )
+                        response = response["choices"][0]["message"]["content"]  # type: ignore
 
                     # Send the response to the channel
                     await send_long_discord_message(message, response)
+                    # we will set the previous_relevant_messages to the summarized version of the relevant messages.
+                    previous_relevant_messages[message.channel.id] = summarize_for_context(recent_messages, relevant_messages)
 
+                    
                     # print("Message was responded to.")
                 else:
                     # print("Message not responded to.")
