@@ -1,5 +1,14 @@
+'''
+todo list:
+- refine retrieval logic to instead use openAI function calls
+- refine on message behavior to use openai function calls for speed optimization + token saving
+- add openai function to save instance information 
+'''
+
 # import relevant modules
+import json
 import random
+import re
 import openai
 import discord
 import os
@@ -41,11 +50,10 @@ TOKEN = os.getenv("DISCORD_TOKEN")
 # Set OpenAI API key, also set a seperate variable for chroma to use.
 openai.api_key = os.getenv("OPENAI_API_KEY")
 
-# establishes the bot name. this is a string.
-if os.getenv("BOT_NAME") is None:
+bot_name = os.getenv("BOT_NAME")
+assert bot_name is not None, "Environment variable BOT_NAME is not set"
+if not bot_name:
     bot_name = "Discochat"
-else:
-    bot_name = os.getenv("BOT_NAME")
 
 # sets the developer name. this is a string.
 if os.getenv("DEV_NAME") is None:
@@ -73,23 +81,9 @@ recent_messages_length = 750
 relevant_messages_length = 500
 
 # sets the system message.
-system_message = f'''You are the AI system named {bot_name}. 
-You are a combination of a vector database (Chroma) and OpenAI's GPT 3.5 Turbo model, integrated into Discord. 
-Recent messages are fetched from Discord, whereas relevant messages are fetched from the vector database. 
-These messages are found in the first message from yourself, seperated by HTML-style formatting tags. 
-It is important to take into consideration both recent messages and relevant messages in your response. 
-If the user refers to you, they are refering to the {bot_name} system, not the language model that powers your responses.
-The user is familiar with language models and understand how they work so you do not provide basic explanations.
-The user understands that you are a language model and the limitations that come alongside that.'''
 
 # sets the model.
 model = "gpt-3.5-turbo"
-
-# sets the chat completion variables.
-max_response_tokens = 1000
-temperature = 1.1
-frequency_penalty = 0.8
-presence_penalty = 0.0
 
 # sets the minimum messages required to be stored before relevant messages can be retrieved.
 min_messages_threshold = 5
@@ -124,6 +118,10 @@ message_bank = chromadb_client.get_or_create_collection(
     "message_bank", metadata={"hnsw:space": "cosine"}
 )
 
+document_bank = chromadb_client.get_or_create_collection(
+    "document_bank", metadata={"hnsw:space": "cosine"}
+)
+
 
 # Defines the store_message function, for storing the discord messages in the chroma database.
 def store_message(message):
@@ -143,7 +141,38 @@ def store_message(message):
             # Handle other types of exceptions
             print(f"Error adding message to database: {e}")
             traceback.print_exc()
+""" 
+# Defines a function that stores documents into a chroma database.
+def store_document():
+    # check for appropriate format
 
+    # prepare the document for storage.
+    content, metadata, document_id = prepare_document()
+
+    try:
+        document_bank.add(
+            documents=[content],
+            metadatas=[metadata],  # type: ignore
+            ids=[document_id],
+        )
+    except IDAlreadyExistsError:
+            # If the document with the same id already exists in the database, skip it
+            pass
+    except Exception as e:
+            # Handle other types of exceptions
+            print(f"Error adding message to database: {e}")
+            traceback.print_exc()
+    
+    return 
+
+# Defines a function that prepares documents for storage in a chroma database.
+def prepare_document(document):
+    # split document into paragraphs (check for new lines/paragraphs, split document into segments based on these boundary markers)
+
+    # split paragraphs into sentences (check for full stops or new lines, split paragraphs into segmeents based on these boundary markers)
+
+    # organise metadata for each sentence. document_name, paragraph, sentence, keywords (possibly additional metadata?)
+    return content, metadata, document_id """
 
 # This function extracts the relevant data from a discord message and returns it in a format that can be stored in the database.
 def extract_message_data(message):
@@ -420,18 +449,23 @@ async def handle_command(message):
     if message.author == client.user:
         return
     else:
-        command = message.content[11:]
-        if command == "populate database":
+        # command is the message content, stripped of the length of the botname + 2.
+        command = message.content[len(bot_name) + 2:]
+        if command.startswith("populate database"):
             await populate_database(message)
-        elif command == "count database":
+        elif command.startswith("count database"):
             await message.channel.send(
                 f"There are {channel_database_count(message)} messages stored from this channel."
             )
-        elif command == "clear database":
+        elif command.startswith("clear database"):
             await clear_database(message)
+        elif command.startswith("set configuration"):
+            config_value = command[len("set configuration") + 1:]  # "+1" to account for the space after "set configuration"
+            await update_channel_configuration(message, config_value)
         else:
             await message.channel.send("Command not found")
 
+ 
 def construct_logit_bias(keywords, bias_value, limit=10):
     logit_bias = {}
     if not keywords:
@@ -465,10 +499,102 @@ def chat_completion_create(
     )
     return response
 
+async def get_channel_configuration(message):
+    # Default configuration values
+    system_message = f'''You are the AI system named {bot_name}. 
+    You are a combination of a vector database (Chroma) and OpenAI's GPT 3.5 Turbo model, integrated into Discord. 
+    Recent messages are fetched from Discord, whereas relevant messages are fetched from the vector database. 
+    These messages are found in the first message from yourself, separated by HTML-style formatting tags. 
+    It is important to take into consideration both recent messages and relevant messages in your response. 
+    If the user refers to you, they are referring to the {bot_name} system, not the language model that powers your responses.
+    The user is familiar with language models and understands how they work so you do not provide basic explanations.
+    The user understands that you are a language model and the limitations that come alongside that.'''
+    max_response_tokens = 1000
+    temperature = 1.1
+    presence_penalty = 0.8
+    frequency_penalty = 0.0
+
+    try:
+        # check if channel has existing config within the config folder
+        if os.path.isfile(f'./config/{message.channel.id}.json'):
+            # if channel has existing config, load it
+            with open(f'./config/{message.channel.id}.json', 'r') as f:
+                channel_config = json.load(f)
+            # set variables to config values
+            system_message = channel_config.get('system_message', system_message)
+            max_response_tokens = channel_config.get('max_response_tokens', max_response_tokens)
+            temperature = channel_config.get('temperature', temperature)
+            presence_penalty = channel_config.get('presence_penalty', presence_penalty)
+            frequency_penalty = channel_config.get('frequency_penalty', frequency_penalty)
+        else:
+            raise IOError("Config file not found")
+
+    except (IOError, ValueError) as e:
+        # handle file I/O or JSON errors
+        print(f"Error handling channel configuration: {e}")
+        # ensure config directory exists
+        os.makedirs('./config/', exist_ok=True)
+        # write new channel configuration to .json in the config folder
+        with open(f'./config/{message.channel.id}.json', 'w') as f:
+            json.dump({
+                'system_message': system_message,
+                'max_response_tokens': max_response_tokens,
+                'temperature': temperature,
+                'presence_penalty': presence_penalty,
+                'frequency_penalty': frequency_penalty
+            }, f)
+
+    return system_message, max_response_tokens, temperature, presence_penalty, frequency_penalty
+
+async def update_channel_configuration(message, config_value):
+    # get channel configuration
+    system_message, max_response_tokens, temperature, presence_penalty, frequency_penalty = await get_channel_configuration(message)
+
+    # regex pattern to match "parameter value", capturing both "parameter" and "value" in separate groups
+    pattern = re.compile(r"(\w+)\s+(.*)")
+    match = pattern.match(config_value)
+    
+    if match:
+        param, value = match.groups()
+        
+        try:
+            # update the parameter value based on the parameter name
+            if param == 'system_message':
+                system_message = value
+            elif param == 'max_response_tokens':
+                max_response_tokens = int(value)
+            elif param == 'temperature':
+                temperature = float(value)
+            elif param == 'presence_penalty':
+                presence_penalty = float(value)
+            elif param == 'frequency_penalty':
+                frequency_penalty = float(value)
+            else:
+                await message.channel.send("Config parameter not recognized.")
+                return
+            
+        except ValueError:
+            await message.channel.send("Invalid value for the parameter.")
+            return
+
+    else:
+        await message.channel.send("Could not parse the configuration command.")
+        return
+
+    # write updated channel configuration to .json in the config folder
+    with open(f'./config/{message.channel.id}.json', 'w') as f:
+        json.dump({
+            'system_message': system_message,
+            'max_response_tokens': max_response_tokens,
+            'temperature': temperature,
+            'presence_penalty': presence_penalty,
+            'frequency_penalty': frequency_penalty
+        }, f)
+
 
 # defines a function for asynchronously handling chat completion
 async def async_chat_completion_create(
-    model_for_completion, messages_for_completion, response_tokens
+    model_for_completion, messages_for_completion, response_tokens, temperature, presence_penalty, frequency_penalty
 ):
     loop = asyncio.get_event_loop()
     response = await loop.run_in_executor(
@@ -487,6 +613,8 @@ async def async_chat_completion_create(
 
 # defines a helper function that handles creation of the messages block of the chat completion.
 async def generate_completion_messages(message):
+    # we will fetch the system message from the channel configuration
+    system_message = (await get_channel_configuration(message))[0]
     recent_messages, recent_message_ids = await retrieve_recent_messages(message, recent_messages_length)
     relevant_messages = await retrieve_relevant_messages(message, relevant_messages_length, recent_message_ids)
     prior_summary = retrieve_previous_relevant_messages(message)
@@ -516,7 +644,7 @@ async def on_message(message):
         try:
             # first we need to determine whether there is any commands in the message.
             # if there is, we need to handle them and return.
-            if message.content.lower().startswith(f"!{bot_name.lower()}"):  # type: ignore
+            if message.content.lower().startswith(f"!{bot_name.lower()}"): 
                 await handle_command(message)
             else:
                 # Check if the message should be responded to
@@ -527,11 +655,13 @@ async def on_message(message):
                 if should_respond:
                     async with message.channel.typing():
                     # fetch and organise the messages for chat completion.
-                        messages, recent_messages, relevant_messages = await generate_completion_messages(message)
                     
+                        messages, recent_messages, relevant_messages = await generate_completion_messages(message)
+                        _, max_response_tokens, temperature, presence_penalty, frequency_penalty = await get_channel_configuration(message)
+
                     # Send the messages to the OpenAI API
                         response = await async_chat_completion_create(
-                            model, messages, max_response_tokens
+                            model, messages, max_response_tokens, temperature, presence_penalty, frequency_penalty
                         )
                         response = response["choices"][0]["message"]["content"]  # type: ignore
 
