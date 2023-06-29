@@ -16,6 +16,7 @@ import traceback
 import atexit
 import nltk
 import textwrap
+import time
 
 # Download nltk data
 nltk.download("stopwords")
@@ -105,9 +106,45 @@ message_bank = chromadb_client.get_or_create_collection(
     "message_bank", metadata={"hnsw:space": "cosine"}
 )
 
-document_bank = chromadb_client.get_or_create_collection(
+""" document_bank = chromadb_client.get_or_create_collection(
     "document_bank", metadata={"hnsw:space": "cosine"}
-)
+) """
+
+# set up a global dictionary to store the on_message_timings
+on_message_timings = {
+    "store_message": [],
+    "handle_command": [],
+    "get_channel_configuration": [],
+    "get_query_terms": [],
+    "generate_completion_messages": [],
+    "create_chat_completion": [],
+    "send_long_discord_message": [],
+}
+
+generate_completion_messages_timings = {
+    "retrieve_recent_messages": [],
+    "retrieve_relevant_messages": [],
+    "message_assembly": [],
+}
+
+retrieve_relevant_messages_timings = {
+    "message_bank_query": [],
+    "message_around": [],
+    "near_messages": [],
+    "formatting": [],
+}
+
+def calculate_average_latencies(set_of_timings, set_of_timings_name):
+    print(f"\n{set_of_timings_name} average latencies:")
+
+    max_section_length = (
+        max(len(section) for section in set_of_timings.keys()) + 2
+    )  # add 2 for a colon and a space
+
+    for section, times in set_of_timings.items():
+        if times:
+            average = sum(times) / len(times)
+            print(f"{section: <{max_section_length}}: {average * 1000: .0f} ms")
 
 
 # Defines the store_message function, for storing the discord messages in the chroma database.
@@ -128,40 +165,6 @@ def store_message(message):
             # Handle other types of exceptions
             print(f"Error adding message to database: {e}")
             traceback.print_exc()
-
-
-""" 
-# Defines a function that stores documents into a chroma database.
-def store_document():
-    # check for appropriate format
-
-    # prepare the document for storage.
-    content, metadata, document_id = prepare_document()
-
-    try:
-        document_bank.add(
-            documents=[content],
-            metadatas=[metadata],  # type: ignore
-            ids=[document_id],
-        )
-    except IDAlreadyExistsError:
-            # If the document with the same id already exists in the database, skip it
-            pass
-    except Exception as e:
-            # Handle other types of exceptions
-            print(f"Error adding message to database: {e}")
-            traceback.print_exc()
-    
-    return 
-
-# Defines a function that prepares documents for storage in a chroma database.
-def prepare_document(document):
-    # split document into paragraphs (check for new lines/paragraphs, split document into segments based on these boundary markers)
-
-    # split paragraphs into sentences (check for full stops or new lines, split paragraphs into segmeents based on these boundary markers)
-
-    # organise metadata for each sentence. document_name, paragraph, sentence, keywords (possibly additional metadata?)
-    return content, metadata, document_id """
 
 
 # This function extracts the relevant data from a discord message and returns it in a format that can be stored in the database.
@@ -232,11 +235,16 @@ async def retrieve_relevant_messages(
     # Set the where conditions to only search in the channel
     where_conditions = {"$and": [{"channel": channel}, {"is_command": "False"}]}
 
+    start = time.time()
+
     relevant_messages = message_bank.query(
         query_texts=query,
         n_results=5,
         where=where_conditions,  # type: ignore
     )
+
+    end = time.time()
+    retrieve_relevant_messages_timings["message_bank_query"].append(end - start)
 
     relevant_messages_result = ""
 
@@ -264,14 +272,28 @@ async def retrieve_relevant_messages(
                 message_id = ids[j]  # Discord message ID is stored in ids
 
                 # Fetch message object by id
-                message_around = await message.channel.fetch_message(message_id)
+                message_around = None
+                try:
+                    start = time.time()
+                    message_around = await message.channel.fetch_message(message_id)
+                    end = time.time()
+                    retrieve_relevant_messages_timings["message_around"].append(end - start)
+                # Process the message
+                except discord.errors.NotFound:
+                    # Handle the error, skip this message, or perform any necessary action
+                    pass
+
+                start = time.time()
                 near_messages = [
                     msg
                     async for msg in message.channel.history(
                         limit=5, around=message_around, oldest_first=True
                     )
                 ]
+                end = time.time()
+                retrieve_relevant_messages_timings["near_messages"].append(end - start)
 
+                start = time.time()
                 for msg in near_messages:
                     if msg.id in seen_messages or msg.id in recent_message_ids:
                         continue
@@ -298,12 +320,14 @@ async def retrieve_relevant_messages(
 
                     else:
                         break  # If adding next message would exceed token limit, break the loop
+                end = time.time()
+                retrieve_relevant_messages_timings["formatting"].append(end - start)
 
     relevant_messages_result = relevant_messages_result[:-2]
 
-    print(
+    """ print(
         f"{relevant_messages_result} is of length {len(token_encoder.encode(relevant_messages_result))}"
-    )
+    ) """
 
     return relevant_messages_result
 
@@ -314,7 +338,7 @@ def summarize(input_text, summary_length=500):
         {"role": "user", "content": f"summarize these messages: {input_text}"},
     ]
 
-    summary = non_async_chat_completion_create(model, messages, summary_length)
+    summary = create_non_async_chat_completion(model, messages, summary_length)
     summary = summary["choices"][0]["message"]["content"]  # type: ignore
     return summary
 
@@ -329,7 +353,7 @@ def summarize_for_context(recent_messages, relevant_messages, summary_length=500
         },
     ]
 
-    summary = non_async_chat_completion_create(model, messages, summary_length)
+    summary = create_non_async_chat_completion(model, messages, summary_length)
     summary = summary["choices"][0]["message"]["content"]  # type: ignore
     return summary
 
@@ -403,7 +427,7 @@ async def populate_database(message):
     async for message in message.channel.history(limit=500):
         store_message(message)
     await message.channel.send(
-        f"Database populated. There are {channel_database_count(message)} messages stored from this channel."
+        f"Database populated. There are {count_channel_database(message)} messages stored from this channel."
     )
     # print(message_bank.get(where={'channel': str(message.channel.id)}))
     return
@@ -412,13 +436,13 @@ async def populate_database(message):
 async def clear_database(message):
     message_bank.delete(where={"channel": str(message.channel.id)})
     await message.channel.send(
-        f"Database cleared. There are {channel_database_count(message)} messages stored from this channel."
+        f"Database cleared. There are {count_channel_database(message)} messages stored from this channel."
     )
     return
 
 
 # defines a helper function for counting the messages in a channel.
-def channel_database_count(message):
+def count_channel_database(message):
     # Query the database for all documents where the channel matches the current channel.
     # As we are not interested in the documents themselves, we only retrieve the metadata.
     channel_id = str(message.channel.id)
@@ -460,7 +484,7 @@ async def handle_command(message):
             await populate_database(message)
         elif command.startswith("count database"):
             await message.channel.send(
-                f"There are {channel_database_count(message)} messages stored from this channel."
+                f"There are {count_channel_database(message)} messages stored from this channel."
             )
         elif command.startswith("clear database"):
             await clear_database(message)
@@ -498,7 +522,7 @@ def construct_logit_bias(keywords, bias_value, limit=10):
 
 
 # defines a function for handling chat completion that isn't asynchronous. this is useful for situations where we NEED the response before continuing. database handling etc.
-def non_async_chat_completion_create(
+def create_non_async_chat_completion(
     model_for_completion, messages_for_completion, response_tokens
 ):
     response = openai.ChatCompletion.create(
@@ -660,22 +684,13 @@ async def reset_channel_configuration(message):
     # delete channel configuration file
     os.remove(f"./config/{message.channel.id}.json")
     # set channel back to default configuration
-    (
-        system_message,
-        max_response_tokens,
-        temperature,
-        presence_penalty,
-        frequency_penalty,
-        recent_messages_length,
-        relevant_messages_length,
-        chat_mode,
-    ) = await get_channel_configuration(message)
+    await get_channel_configuration(message)
     # send confirmation message
     await message.channel.send("Channel configuration reset.")
 
 
 # defines a function for asynchronously handling chat completion
-async def chat_completion_create(
+async def create_chat_completion(
     model_for_completion,
     messages_for_completion,
     response_tokens,
@@ -761,19 +776,27 @@ async def generate_completion_messages(
     relevant_messages_length,
     chat_mode,
 ):
+    start = time.time()
     recent_messages, recent_message_ids = await retrieve_recent_messages(
         message, recent_messages_length
     )
     recent_messages_string = " ".join(recent_messages)
+    end = time.time()
+    generate_completion_messages_timings["retrieve_recent_messages"].append(end - start)
     if chat_mode == "standard":
+        start = time.time()
         relevant_messages = await retrieve_relevant_messages(
             message, query_terms, relevant_messages_length, recent_message_ids
+        )
+        end = time.time()
+        generate_completion_messages_timings["retrieve_relevant_messages"].append(
+            end - start
         )
     else:
         relevant_messages = ""
     prior_summary = ""  # retrieve_previous_relevant_messages(message)
     # we will summarize the messages and store them in the dictionary previously_relevant_messages as the value for the channel ID key.
-
+    start = time.time()
     timestamp = str(message.created_at)[:-16]
 
     if prior_summary != "":
@@ -794,7 +817,12 @@ async def generate_completion_messages(
         {"role": "assistant", "content": assistant_message},
         {"role": "user", "content": f"{message.clean_content}"},
     ]
+    end = time.time()
+    generate_completion_messages_timings["message_assembly"].append(end - start)
     # print(messages)
+    calculate_average_latencies(
+        generate_completion_messages_timings, "generate_completion_messages"
+    )
     return messages, recent_messages, relevant_messages
 
 
@@ -802,12 +830,18 @@ async def generate_completion_messages(
 async def on_message(message):
     # First we'll check roles, if the user doesn't have the required role, we'll return.
     if check_permissions(message) == True:
+        start = time.time()
         store_message(message)
+        end = time.time()
+        on_message_timings["store_message"].append(end - start)
         try:
             # first we need to determine whether there is any commands in the message.
             # if there is, we need to handle them and return.
             if message.content.lower().startswith(f"!{bot_name.lower()}"):
+                start = time.time()
                 await handle_command(message)
+                end = time.time()
+                on_message_timings["handle_command"].append(end - start)
             else:
                 # Check if the message should be responded to
                 should_respond = (
@@ -817,6 +851,7 @@ async def on_message(message):
                 if should_respond:
                     async with message.channel.typing():
                         # fetch and organise the messages for chat completion.
+                        start = time.time()
                         (
                             system_message,
                             max_response_tokens,
@@ -827,10 +862,18 @@ async def on_message(message):
                             relevant_messages_length,
                             chat_mode,
                         ) = await get_channel_configuration(message)
+                        end = time.time()
+                        on_message_timings["get_channel_configuration"].append(
+                            end - start
+                        )
                         if chat_mode == "standard":
+                            start = time.time()
                             query_terms = await get_query_terms(message)
+                            end = time.time()
+                            on_message_timings["get_query_terms"].append(end - start)
                         else:
                             query_terms = []
+                        start = time.time()
                         (
                             messages,
                             recent_messages,
@@ -843,13 +886,19 @@ async def on_message(message):
                             relevant_messages_length,
                             chat_mode,
                         )
+                        end = time.time()
+                        on_message_timings["generate_completion_messages"].append(
+                            end - start
+                        )
+
                         if chat_mode == "long context":
                             model_for_responses = "gpt-3.5-turbo-16k"
                         else:
                             model_for_responses = model
 
+                        start = time.time()
                         # Send the messages to the OpenAI API
-                        response = await chat_completion_create(
+                        response = await create_chat_completion(
                             model_for_responses,
                             messages,
                             max_response_tokens,
@@ -858,20 +907,20 @@ async def on_message(message):
                             frequency_penalty,
                         )
                         response = response["choices"][0]["message"]["content"]  # type: ignore
+                        end = time.time()
+                        on_message_timings["create_chat_completion"].append(end - start)
 
                     # Send the response to the channel
+                    start = time.time()
                     await send_long_discord_message(message, response)
-                    # we will set the previous_relevant_messages to the summarized version of the relevant messages.
+                    end = time.time()
+                    on_message_timings["send_long_discord_message"].append(end - start)
 
-                    # !!! disabled for now while we implement the function calls version of retrieve_relevant_messages.
-                    # previous_relevant_messages[message.channel.id] = summarize_for_context(recent_messages, relevant_messages)
+                    calculate_average_latencies(on_message_timings, "on_message")
 
-                    # print("Message was responded to.")
                 else:
                     # print("Message not responded to.")
                     pass
-
-            # print the alt_relevant_messages to the console if the message author is the dev.
 
         # If an error occurs, print it to the console.
         except Exception:
