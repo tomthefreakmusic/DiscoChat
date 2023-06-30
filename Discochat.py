@@ -134,6 +134,7 @@ retrieve_relevant_messages_timings = {
     "formatting": [],
 }
 
+
 def calculate_average_latencies(set_of_timings, set_of_timings_name):
     print(f"\n{set_of_timings_name} average latencies:")
 
@@ -277,7 +278,9 @@ async def retrieve_relevant_messages(
                     start = time.time()
                     message_around = await message.channel.fetch_message(message_id)
                     end = time.time()
-                    retrieve_relevant_messages_timings["message_around"].append(end - start)
+                    retrieve_relevant_messages_timings["message_around"].append(
+                        end - start
+                    )
                 # Process the message
                 except discord.errors.NotFound:
                     # Handle the error, skip this message, or perform any necessary action
@@ -324,10 +327,6 @@ async def retrieve_relevant_messages(
                 retrieve_relevant_messages_timings["formatting"].append(end - start)
 
     relevant_messages_result = relevant_messages_result[:-2]
-
-    """ print(
-        f"{relevant_messages_result} is of length {len(token_encoder.encode(relevant_messages_result))}"
-    ) """
 
     return relevant_messages_result
 
@@ -763,7 +762,6 @@ async def get_query_terms(message):
     arguments_dict = json.loads(arguments)
     terms = arguments_dict.get("terms", [])
 
-    # print(terms)
     return terms
 
 
@@ -819,7 +817,6 @@ async def generate_completion_messages(
     ]
     end = time.time()
     generate_completion_messages_timings["message_assembly"].append(end - start)
-    # print(messages)
     calculate_average_latencies(
         generate_completion_messages_timings, "generate_completion_messages"
     )
