@@ -757,86 +757,116 @@ async def generate_completion_messages(
     return messages, recent_messages, relevant_messages
 
 
-# defines a function that handles messages sent on discord that the bot can see.
+# defines a function for handling messages.
 async def on_message(message):
-    # First we'll check roles, if the user doesn't have the required role, we'll return.
     if check_permissions(message):
         store_message(message)
         try:
-            # first we need to determine whether there is any commands in the message.
-            # if there is, we need to handle them and return.
-            if message.content.lower().startswith(f"!{bot_name.lower()}"):
+            if await is_command(message):
                 await handle_command(message)
-            else:
-                # Check if the message should be responded to
-                should_respond = (
-                    client.user in message.mentions and message.author != client.user
-                ) or (is_dm(message) and message.author != client.user)
-                # If the message should be responded to, send a response
-                if should_respond:
-                    async with message.channel.typing():
-                        # fetch and organise the messages for chat completion.
-
-                        (
-                            system_message,
-                            max_response_tokens,
-                            temperature,
-                            presence_penalty,
-                            frequency_penalty,
-                            recent_messages_length,
-                            relevant_messages_length,
-                            chat_mode,
-                        ) = await get_channel_configuration(message)
-
-                        if chat_mode == "standard":
-                            query_terms = await get_query_terms(message)
-
-                        else:
-                            query_terms = []
-
-                        (
-                            messages,
-                            recent_messages,
-                            relevant_messages,
-                        ) = await generate_completion_messages(
-                            message,
-                            system_message,
-                            query_terms,
-                            recent_messages_length,
-                            relevant_messages_length,
-                            chat_mode,
-                        )
-
-                        if chat_mode == "long context":
-                            model_for_responses = "gpt-3.5-turbo-16k"
-                        else:
-                            model_for_responses = model
-
-                        # Send the messages to the OpenAI API
-                        response = await create_chat_completion(
-                            model_for_responses,
-                            messages,
-                            max_response_tokens,
-                            temperature,
-                            presence_penalty,
-                            frequency_penalty,
-                        )
-                        response = response["choices"][0]["message"]["content"]  # type: ignore
-
-                    # Send the response to the channel
-
-                    await send_long_discord_message(message, response)
-
-                else:
-                    # print("Message not responded to.")
-                    pass
-
-        # If an error occurs, print it to the console.
+            elif await should_respond(message):
+                await respond_to_message(message)
         except Exception:
-            # print(f"Error occurred: {e} \n")
-            traceback.print_exc()
-    else:
-        pass
+            handle_exception()
+
+
+# defines a helper function for checking if a message is a command.
+async def is_command(message):
+    return message.content.lower().startswith(f"!{bot_name.lower()}")
+
+
+# defines a helper function for checking whether a message should be responded to.
+async def should_respond(message):
+    return (client.user in message.mentions and message.author != client.user) or (
+        is_dm(message) and message.author != client.user
+    )
+
+
+# defines a helper function for handling responses.
+async def respond_to_message(message):
+    # sends the "typing" status to discord.
+    async with message.channel.typing():
+        # fetches channel configuration
+        (
+            system_message,
+            max_response_tokens,
+            temperature,
+            presence_penalty,
+            frequency_penalty,
+            recent_messages_length,
+            relevant_messages_length,
+            chat_mode,
+        ) = await get_channel_configuration(message)
+        # if chat_mode is standard, we'll fetch the query terms.
+        query_terms = await get_query_terms(message) if chat_mode == "standard" else []
+        # we'll now generate the completion messages.
+        completion_messages, _, _ = await generate_completion_messages(
+            message,
+            system_message,
+            query_terms,
+            recent_messages_length,
+            relevant_messages_length,
+            chat_mode,
+        )
+        # checks which model we are using based on the chat_mode.
+        model_for_responses = get_model_for_responses(chat_mode)
+        # gets the response via openAI api.
+        response = await get_response(
+            model_for_responses,
+            completion_messages,
+            max_response_tokens,
+            temperature,
+            presence_penalty,
+            frequency_penalty,
+        )
+        # sends the response message to discord.
+        await send_long_discord_message(message, response)
+
+
+# defines a helper function that checks which model we are using for response based on chat_mode.
+def get_model_for_responses(chat_mode):
+    return "gpt-3.5-turbo-16k" if chat_mode == "long context" else model
+
+
+async def get_response(
+    model_for_responses,
+    messages,
+    max_response_tokens,
+    temperature,
+    presence_penalty,
+    frequency_penalty,
+):
+    try:
+        response = await create_chat_completion(
+            model_for_responses,
+            messages,
+            max_response_tokens,
+            temperature,
+            presence_penalty,
+            frequency_penalty,
+        )
+        return response["choices"][0]["message"]["content"]  # type: ignore
+
+    except openai.Timeout as e:  # type: ignore
+        print(f"OpenAI API timeout error: {e}")
+        return "Sorry, the response took too long to generate. Please try again later."
+
+    except openai.InvalidRequestError as e:
+        print(f"OpenAI API invalid request error: {e}")
+        return "Sorry, there was an issue with the request. Please try again later."
+
+    except openai.ServiceUnavailableError as e:  # type: ignore
+        print(f"OpenAI API service unavailable error: {e}")
+        return "Sorry, the service is currently unavailable. Please try again later."
+
+    except Exception as e:  # This will catch any other exceptions
+        print(f"Non-API error occurred: {e}")
+        return "Sorry, an unexpected error occurred. Please try again later."
+
+
+def handle_exception():
+    print(f"Error occurred: {e} \n")
+    traceback.print_exc()
 
 
 # defines a helper function that handles messages bigger than discord handles by default (nitro makes this redundant)
