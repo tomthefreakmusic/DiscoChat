@@ -77,7 +77,7 @@ model_for_function_calls = "gpt-3.5-turbo-0613"
 min_messages_threshold = 5
 
 # creates a ephemeral dictionary for storing the previous relevant messages, these are currently summarized before storage.
-previous_relevant_messages = {}
+previously_relevant_messages = {}
 
 # sets maximum message length (if you have nitro this could be increased)
 max_discord_message_length = 2000
@@ -180,8 +180,12 @@ def get_keywords(text, num_keywords=5):
 
 
 async def retrieve_relevant_messages(
-    message, query_terms, token_length, recent_message_ids
+    message, query_terms, token_length, recent_message_ids=None
 ):
+    if recent_message_ids is None:
+        recent_message_ids = []
+    if not query_terms:
+        return ""
     query = []
     # get keywords from message.clean_content, add these to the query list
     query.extend(query_terms)
@@ -275,6 +279,49 @@ async def retrieve_relevant_messages(
     return relevant_messages_result
 
 
+async def retrieve_sporadic_messages(message, token_length):
+    channel = str(message.channel.id)
+    where_conditions = {"$and": [{"channel": channel}, {"is_command": "False"}]}
+
+    sporadic_messages = message_bank.get(
+        where = where_conditions,  # type: ignore
+        include = ["metadatas", "documents"]
+    )
+
+    sporadic_messages_result = ""
+    message_indices = list(range(len(sporadic_messages["ids"])))  # Create a list of indices
+    random.shuffle(message_indices)  # Randomize the order of indices
+
+    for i in message_indices:
+        id = sporadic_messages["ids"][i]
+        document = sporadic_messages["documents"][i] # type: ignore
+        metadata = sporadic_messages["metadatas"][i] # type: ignore
+
+        message_content = document
+
+        # Truncate long words
+        for word in message_content.split():
+            if len(word) > 28:
+                message_content = message_content.replace(
+                    word, word[:28] + "..."
+                )
+
+        created_at = str(metadata['created_at'])[:-16]
+        author = metadata['author']
+
+        temp_string = f"[{created_at}] {author}: {message_content}, "
+        current_message_tokens = len(
+            token_encoder.encode(sporadic_messages_result + temp_string)
+        )
+
+        if current_message_tokens <= token_length:
+            sporadic_messages_result += temp_string
+        else:
+            break  # If adding next message would exceed token limit, break the loop
+
+    sporadic_messages_result = sporadic_messages_result[:-2]
+    return sporadic_messages_result
+
 # Defines a function that stores relevant messages in a dictionary.
 def summarize(input_text, summary_length=500):
     messages = [
@@ -302,10 +349,10 @@ def summarize_for_context(recent_messages, relevant_messages, summary_length=500
 
 
 # Defines a helper function that retrieves the strings from "previous_relevant_messages" for the channel and returns the string.
-def retrieve_previous_relevant_messages(message):
+def retrieve_previously_relevant_messages(message):
     channel = message.channel.id
-    if channel in previous_relevant_messages:
-        result_string = previous_relevant_messages[channel]
+    if channel in previously_relevant_messages:
+        result_string = previously_relevant_messages[channel]
         return result_string
     else:
         return ""
@@ -718,43 +765,80 @@ async def generate_completion_messages(
     relevant_messages_length,
     chat_mode,
 ):
-    recent_messages, recent_message_ids = await retrieve_recent_messages(
-        message, recent_messages_length
-    )
-    recent_messages_string = " ".join(recent_messages)
+    # Map chat modes to corresponding retrieval functions
+    retrieval_functions = {
+        "standard": [
+            ("recent messages", retrieve_recent_messages, False, False),
+            ("relevant messages", retrieve_relevant_messages, True, True),
+            #("previously relevant messages", retrieve_previously_relevant_messages, False, False),
+        ],
+        "gpt4": [
+            ("recent messages", retrieve_recent_messages, False, False),
+            ("relevant messages", retrieve_relevant_messages, True, True),
+            #("previously relevant messages", retrieve_previously_relevant_messages, False, False),
+        ],
+        "sporadic": [
+            ("recent messages", retrieve_recent_messages, False, False),
+            ("relevant messages", retrieve_relevant_messages, True, True),
+            ("sporadic messages", retrieve_sporadic_messages, False, False),
+            #("previously relevant messages", retrieve_previously_relevant_messages, False, False),
+        ]
+    }
 
-    if chat_mode == "standard":
-        relevant_messages = await retrieve_relevant_messages(
-            message, query_terms, relevant_messages_length, recent_message_ids
-        )
 
-    else:
-        relevant_messages = ""
-    prior_summary = ""  # retrieve_previous_relevant_messages(message)
-    # we will summarize the messages and store them in the dictionary previously_relevant_messages as the value for the channel ID key.
+    # Generate message tags
+    message_tags = {}
 
-    timestamp = str(message.created_at)[:-16]
+    # Initialize recent_message_ids
+    recent_message_ids = []
 
-    if prior_summary != "":
-        prior_summary = f"<previously relevant messages> {prior_summary} </previously relevant messages>"
-    if recent_messages != "":
-        recent_messages = (
-            f"<recent messages> {recent_messages_string} </recent messages>"
-        )
-    if relevant_messages != "":
-        relevant_messages = (
-            f"<relevant messages> {relevant_messages} </relevant messages>"
-        )
+    print(f"Chat mode: {chat_mode}")  # Print the chat mode
+    print(f"Query terms: {query_terms}")  # Print the query terms
 
-    assistant_message = f"I am talking to the user: {message.author.name}.{recent_messages}{relevant_messages}{prior_summary} The time is {timestamp}."
+    # Get messages based on chat mode
+    functions_for_mode = retrieval_functions.get(chat_mode, [("default", do_nothing, False, False)])
+    for tag, function, requires_ids, requires_query_terms in functions_for_mode:
+        print(f"Function for mode: {function.__name__}")  # Print the function that should be called
+        if function == retrieve_recent_messages:
+            recent_messages, recent_message_ids = await function(message, recent_messages_length)
+            message_content = " ".join(recent_messages)
+        elif requires_query_terms and query_terms:
+            message_content = await function(message, query_terms, relevant_messages_length, recent_message_ids)
+        elif not requires_query_terms and requires_ids:
+            message_content = await function(message, relevant_messages_length, recent_message_ids)
+        elif not requires_query_terms and not requires_ids:
+            message_content = await function(message, relevant_messages_length)
+        else:
+            print(f"Skipping function for {tag} because query_terms is empty.")
+            continue
 
+        print(f"Function for {tag} returned: {message_content}")  # Print the content that was returned
+
+        if message_content:  # Check if the content is not empty
+            message_tags[f"<{tag}>"] = message_content
+
+    # Add all tags to the message
+    assistant_message = f"I am talking to the user: {message.author.name}."
+    for tag, content in message_tags.items():
+        if content:
+            assistant_message += f" {tag} {content} {tag.replace('<', '</')}"
+
+    assistant_message += f" The time is {str(message.created_at)[:-16]}."
     messages = [
         {"role": "system", "content": system_message},
         {"role": "assistant", "content": assistant_message},
         {"role": "user", "content": f"{message.clean_content}"},
     ]
 
+    # Extract the recent and relevant messages from the message tags for the return statement
+    recent_messages = message_tags.get("<recent messages>", "")
+    relevant_messages = message_tags.get("<relevant messages>", "")
+
     return messages, recent_messages, relevant_messages
+
+
+async def do_nothing(*args, **kwargs):
+    return ""
 
 
 # defines a function for handling messages.
@@ -766,8 +850,8 @@ async def on_message(message):
                 await handle_command(message)
             elif await should_respond(message):
                 await respond_to_message(message)
-        except Exception:
-            handle_exception()
+        except Exception as e:
+            handle_exception(e)
 
 
 # defines a helper function for checking if a message is a command.
@@ -798,7 +882,8 @@ async def respond_to_message(message):
             chat_mode,
         ) = await get_channel_configuration(message)
         # if chat_mode is standard, we'll fetch the query terms.
-        query_terms = await get_query_terms(message) if chat_mode == "standard" else []
+        query_terms = await get_query_terms(message) if chat_mode in {"standard", "gpt4"} else []
+
         # we'll now generate the completion messages.
         completion_messages, _, _ = await generate_completion_messages(
             message,
@@ -825,8 +910,13 @@ async def respond_to_message(message):
 
 # defines a helper function that checks which model we are using for response based on chat_mode.
 def get_model_for_responses(chat_mode):
-    return "gpt-3.5-turbo-16k" if chat_mode == "long context" else model
-
+    if chat_mode == "long context":
+        return "gpt-3.5-turbo-16k"
+    elif chat_mode == "gpt4":
+        return "gpt-4"
+    elif chat_mode == "sporadic":
+        return "gpt-4"
+    else: return model
 
 async def get_response(
     model_for_responses,
@@ -864,7 +954,7 @@ async def get_response(
         return "Sorry, an unexpected error occurred. Please try again later."
 
 
-def handle_exception():
+def handle_exception(e):
     print(f"Error occurred: {e} \n")
     traceback.print_exc()
 
