@@ -15,7 +15,9 @@ from rake_nltk import Rake
 import nltk
 import textwrap
 import atexit
-import ast
+from nltk.tokenize import word_tokenize
+from nltk.corpus import stopwords
+from collections import Counter
 
 # Download nltk data
 nltk.download("stopwords")
@@ -75,7 +77,7 @@ CHAT_MODE_PRESETS = {
         "recent_messages_length": 2000,
         "relevant_messages_length": 0,
         "sporadic_messages_length": 0,
-        "max_response_tokens": 200,
+        "max_response_tokens": 1000,
         "system_message": "You are a helpful AI assistant.",
         "temperature": 0.8
     },
@@ -83,7 +85,7 @@ CHAT_MODE_PRESETS = {
         "recent_messages_length": 2000,
         "relevant_messages_length": 2000,
         "sporadic_messages_length": 0,
-        "max_response_tokens": 500,
+        "max_response_tokens": 1000,
         "system_message": "You are a helpful AI assistant with access to conversation history.",
         "temperature": 0.8
     },
@@ -91,9 +93,19 @@ CHAT_MODE_PRESETS = {
         "recent_messages_length": 1000,
         "relevant_messages_length": 0,
         "sporadic_messages_length": 3000,
-        "max_response_tokens": 200,
+        "max_response_tokens": 1000,
         "system_message": "You are a creative AI assistant, feel free to be imaginative in your responses.",
         "temperature": 1.0
+    },
+    "Extended Memory": {
+        "recent_messages_length": 10000,  # Increased to capture more context
+        "relevant_messages_length": 10000,  # Increased to capture more relevant messages
+        "sporadic_messages_length": 0,
+        "max_response_tokens": 1000,
+        "system_message": "You are a helpful AI assistant with access to an extended conversation history.",
+        "temperature": 0.8,
+        "summary_model": "claude-3-haiku-20240307",  # Use a smaller model for summarization
+        "summary_max_tokens": 500  # Limit the summary length
     }
 }
 
@@ -355,6 +367,25 @@ def summarize_for_context(recent_messages, relevant_messages, summary_length=500
     )
     return summary.content
 
+async def summarize_extended_context(recent_messages, relevant_messages, summary_model, summary_max_tokens):
+    context = f"Recent messages:\n{recent_messages}\n\nRelevant messages:\n{relevant_messages}"
+    
+    system_content = "You are an AI assistant tasked with summarizing conversation context. Provide a concise summary that captures the key points and context of the conversation."
+    
+    user_content = f"Please summarize the following conversation context, focusing on the most important information and maintaining continuity:\n\n{context}"
+
+    response = anthropic_client.messages.create(
+        model=summary_model,
+        max_tokens=summary_max_tokens,
+        temperature=0.7,
+        system=system_content,
+        messages=[
+            {"role": "user", "content": user_content}
+        ]
+    )
+
+    return response.content[0].text
+
 # Defines a helper function that retrieves the strings from "previous_relevant_messages" for the channel and returns the string.
 def retrieve_previously_relevant_messages(message):
     channel = message.channel.id
@@ -544,13 +575,42 @@ def format_channel_config(config, chat_mode):
             formatted += f"**{key}:** {value}\n"
     return formatted
 
-
-async def get_query_terms(message):
-    config, chat_mode = await get_channel_configuration(message)
+async def get_query_terms(message, chat_mode):
+    config, _ = await get_channel_configuration(message)
     
-    if chat_mode != "Memory":
+    if chat_mode not in {"Memory", "Extended Memory"}:
         return []
 
+    if chat_mode == "Extended Memory":
+        return await get_fast_query_terms(message)
+    else:
+        return await get_detailed_query_terms(message)
+
+async def get_fast_query_terms(message, num_terms=5):
+    # Get recent messages
+    recent_messages, _ = await retrieve_recent_messages(message, 2000, 10)
+    recent_messages_string = "".join(recent_messages)
+    
+    # Add the current message
+    timestamp = str(message.created_at)[:-16]
+    user_message = f"[{timestamp}] {message.author.name}: {message.clean_content}"
+    full_text = recent_messages_string + user_message
+
+    # Tokenize and lowercase the text
+    tokens = word_tokenize(full_text.lower())
+
+    # Remove stopwords and non-alphabetic tokens
+    stop_words = set(stopwords.words('english'))
+    filtered_tokens = [word for word in tokens if word.isalpha() and word not in stop_words]
+
+    # Get the most common words
+    word_freq = Counter(filtered_tokens)
+    common_words = word_freq.most_common(num_terms)
+
+    # Return just the words, not their frequencies
+    return [word for word, _ in common_words]
+
+async def get_detailed_query_terms(message):
     recent_messages, _ = await retrieve_recent_messages(message, 1000, 6)
     recent_messages_string = "".join(recent_messages)
     timestamp = str(message.created_at)[:-16]
@@ -605,6 +665,10 @@ async def generate_completion_messages(
             ("recent messages", retrieve_recent_messages, False, False),
             ("sporadic messages", retrieve_sporadic_messages, False, False),
         ],
+        "Extended Memory": [
+            ("recent messages", retrieve_recent_messages, False, False),
+            ("relevant messages", retrieve_relevant_messages, True, True),
+        ],
     }
 
     # Generate message tags
@@ -621,9 +685,7 @@ async def generate_completion_messages(
         chat_mode, [("default", do_nothing, False, False)]
     )
     for tag, function, requires_ids, requires_query_terms in functions_for_mode:
-        print(
-            f"Function for mode: {function.__name__}"
-        )  # Print the function that should be called
+        print(f"Function for mode: {function.__name__}")  # Print the function that should be called
         if function == retrieve_recent_messages:
             recent_messages, recent_message_ids = await function(
                 message, recent_messages_length
@@ -632,37 +694,44 @@ async def generate_completion_messages(
         elif function == retrieve_relevant_messages:
             message_content = await function(
                 message, query_terms, relevant_messages_length, recent_message_ids
-        )
+            )
         elif function == retrieve_sporadic_messages:
             message_content = await function(message, sporadic_messages_length)
         else:
             print(f"Skipping function for {tag} because query_terms is empty.")
             continue
 
-        print(
-            f"Function for {tag} returned: {message_content}"
-        )  # Print the content that was returned
+        print(f"Function for {tag} returned: {message_content}")  # Print the content that was returned
 
         if message_content:  # Check if the content is not empty
             message_tags[f"<{tag}>"] = message_content
 
-    # Add all tags to the message
-    assistant_message = f"I am talking to the user: {message.author.name}."
-    for tag, content in message_tags.items():
-        if content:
-            assistant_message += f" {tag} {content} {tag.replace('<', '</')}"
-
     # Construct the context message
-    context_message = "Chat context and history: "
-    for tag, content in message_tags.items():
-        if content:
-            context_message += f"{tag} {content} {tag.replace('<', '</')} "
+    context_message = f"I am an AI assistant talking to the user: {message.author.name}. The current time is {str(message.created_at)[:-16]}. "
 
-    assistant_message += f" The time is {str(message.created_at)[:-16]}."
+    # Add the most recent messages directly to the context
+    recent_context = "\n".join(recent_messages[-5:])  # Include the 5 most recent messages
+    context_message += f"Here are the most recent messages:\n{recent_context}\n\n"
+
+    if chat_mode == "Extended Memory":
+        config = CHAT_MODE_PRESETS["Extended Memory"]
+        summary = await summarize_extended_context(
+            message_tags.get("<recent messages>", ""),
+            message_tags.get("<relevant messages>", ""),
+            config["summary_model"],
+            config["summary_max_tokens"]
+        )
+        context_message += f"Extended conversation summary: {summary}"
+    else:
+        context_message += "Additional chat context and history: "
+        for tag, content in message_tags.items():
+            if content:
+                context_message += f"{tag} {content} {tag.replace('<', '</')} "
+
     # Construct the message array
     messages = [
         {"role": "user", "content": context_message},
-        {"role": "assistant", "content": f"Thank you for providing the context. I'll keep that in mind for our conversation."},
+        {"role": "assistant", "content": "Thank you for providing the context. I'll keep that in mind for our conversation."},
         {"role": "user", "content": message.clean_content}
     ]
 
@@ -702,9 +771,7 @@ async def respond_to_message(message):
     async with message.channel.typing():
         config, chat_mode = await get_channel_configuration(message)
         
-        query_terms = (
-            await get_query_terms(message) if chat_mode in {"Memory"} else []
-        )
+        query_terms = await get_query_terms(message, chat_mode)
 
         completion_messages, _, _, system_message = await generate_completion_messages(
             message,
