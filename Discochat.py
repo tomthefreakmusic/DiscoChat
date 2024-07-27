@@ -4,6 +4,7 @@ import re
 import traceback
 import anthropic
 import discord
+from discord.ui import View, Button
 import os
 import asyncio
 import chromadb
@@ -14,6 +15,7 @@ from rake_nltk import Rake
 import nltk
 import textwrap
 import atexit
+import ast
 
 # Download nltk data
 nltk.download("stopwords")
@@ -66,7 +68,34 @@ else:
     database_directory = os.getenv("DATABASE_DIRECTORY")
 
 # sets the model.
-model = anthropic.CLAUDE_3_OPUS_20240229
+model = "claude-3-5-sonnet-20240620"
+
+CHAT_MODE_PRESETS = {
+    "Default": {
+        "recent_messages_length": 2000,
+        "relevant_messages_length": 0,
+        "sporadic_messages_length": 0,
+        "max_response_tokens": 200,
+        "system_message": "You are a helpful AI assistant.",
+        "temperature": 0.8
+    },
+    "Memory": {
+        "recent_messages_length": 2000,
+        "relevant_messages_length": 2000,
+        "sporadic_messages_length": 0,
+        "max_response_tokens": 500,
+        "system_message": "You are a helpful AI assistant with access to conversation history.",
+        "temperature": 0.8
+    },
+    "Day Dream": {
+        "recent_messages_length": 1000,
+        "relevant_messages_length": 0,
+        "sporadic_messages_length": 3000,
+        "max_response_tokens": 200,
+        "system_message": "You are a creative AI assistant, feel free to be imaginative in your responses.",
+        "temperature": 1.0
+    }
+}
 
 # sets the minimum messages required to be stored before relevant messages can be retrieved.
 min_messages_threshold = 5
@@ -345,7 +374,6 @@ async def retrieve_recent_messages(message, token_length, limit=151):
     # defines a list to store the history
     recent_messages = []
     recent_message_ids = [message.id]
-    recent_message_content = ""
 
     message_number = 0
     async for message in message.channel.history(limit=limit):
@@ -431,7 +459,6 @@ async def handle_command(message):
     if message.author == client.user:
         return
     else:
-        # command is the message content, stripped of the length of the botname + 2
         command = message.content[len(bot_name) + 2 :]
         if command.startswith("populate database"):
             await populate_database(message)
@@ -441,142 +468,56 @@ async def handle_command(message):
             )
         elif command.startswith("clear database"):
             await clear_database(message)
-        elif command.startswith("set configuration"):
-            config_value = command[
-                len("set configuration") + 1 :
-            ]  # "+1" to account for the space after "set configuration"
-            await update_channel_configuration(message, config_value)
-        elif command.startswith("reset configuration"):
-            await reset_channel_configuration(message)
+        elif command.startswith("set chat mode"):
+            await create_chat_mode_form(message)
+        elif command.startswith("show configuration"):
+            config, chat_mode = await get_channel_configuration(message)
+            formatted_config = format_channel_config(config, chat_mode)
+            await message.channel.send(formatted_config)
         else:
             await message.channel.send("Command not found")
 
 async def get_channel_configuration(message):
-    # Default configuration values
-    system_message = f"""You are the AI system named {bot_name}. 
-    You are a combination of a vector database (Chroma) and Anthropic's Claude model, integrated into Discord. 
-    Recent messages are fetched from Discord, whereas relevant messages are fetched from the vector database. 
-    These messages are found in the first message from yourself, separated by HTML-style formatting tags. 
-    It is important to take into consideration both recent messages and relevant messages in your response. 
-    If the user refers to you, they are referring to the {bot_name} system, not the language model that powers your responses.
-    The user is familiar with language models and understands how they work so you do not provide basic explanations.
-    The user understands that you are a language model and the limitations that come alongside that."""
-    max_response_tokens = 1000
-    recent_messages_length = 750
-    relevant_messages_length = 500
-    temperature = 1.1
-    chat_mode = "standard"
-
     try:
-        # check if channel has existing config within the config folder
         if os.path.isfile(f"./config/{message.channel.id}.json"):
-            # if channel has existing config, load it
             with open(f"./config/{message.channel.id}.json", "r") as f:
                 channel_config = json.load(f)
-            # set variables to config values
-            system_message = channel_config.get("system_message", system_message)
-            max_response_tokens = channel_config.get(
-                "max_response_tokens", max_response_tokens
-            )
-            temperature = channel_config.get("temperature", temperature)
-            recent_messages_length = channel_config.get(
-                "recent_messages_length", recent_messages_length
-            )
-            relevant_messages_length = channel_config.get(
-                "relevant_messages_length", relevant_messages_length
-            )
-            chat_mode = channel_config.get("chat_mode", chat_mode)
+            chat_mode = channel_config.get("chat_mode", "Default")
         else:
-            raise IOError("Config file not found")
+            chat_mode = "Default"
 
-    except (IOError, ValueError) as e:
-        # handle file I/O or JSON errors
+        config = CHAT_MODE_PRESETS[chat_mode]
+        return config, chat_mode
+
+    except (IOError, ValueError, KeyError) as e:
         print(f"Error handling channel configuration: {e}")
-        # ensure config directory exists
         os.makedirs("./config/", exist_ok=True)
-        # write new channel configuration to .json in the config folder
         with open(f"./config/{message.channel.id}.json", "w") as f:
-            json.dump(
-                {
-                    "system_message": system_message,
-                    "max_response_tokens": max_response_tokens,
-                    "temperature": temperature,
-                    "recent_messages_length": recent_messages_length,
-                    "relevant_messages_length": relevant_messages_length,
-                    "chat_mode": chat_mode,
-                },
-                f,
-            )
+            json.dump({"chat_mode": "Default"}, f)
+        return CHAT_MODE_PRESETS["Default"], "Default"
 
-    return (
-        system_message,
-        max_response_tokens,
-        temperature,
-        recent_messages_length,
-        relevant_messages_length,
-        chat_mode,
-    )
-
-async def update_channel_configuration(message, config_value):
-    # get channel configuration
-    (
-        system_message,
-        max_response_tokens,
-        temperature,
-        recent_messages_length,
-        relevant_messages_length,
-        chat_mode,
-    ) = await get_channel_configuration(message)
-
-    # regex pattern to match "parameter value", capturing both "parameter" and "value" in separate groups
-    pattern = re.compile(r"(\w+)\s+(.*)")
-    match = pattern.match(config_value)
-
-    if match:
-        param, value = match.groups()
-
-        try:
-            # update the parameter value based on the parameter name
-            if param == "system_message":
-                system_message = value
-            elif param == "max_response_tokens":
-                max_response_tokens = int(value)
-            elif param == "temperature":
-                temperature = float(value)
-            elif param == "recent_messages_length":
-                recent_messages_length = int(value)
-            elif param == "relevant_messages_length":
-                relevant_messages_length = int(value)
-            elif param == "chat_mode":
-                chat_mode = value
-            else:
-                await message.channel.send("Config parameter not recognized.")
-                return
-
-        except ValueError:
-            await message.channel.send("Invalid value for the parameter.")
-            return
-
-    else:
-        await message.channel.send("Could not parse the configuration command.")
+async def update_channel_configuration(message, new_chat_mode):
+    if new_chat_mode not in CHAT_MODE_PRESETS:
+        await message.channel.send(f"Invalid chat mode. Available modes: {', '.join(CHAT_MODE_PRESETS.keys())}")
         return
 
-    # if we get here, the config command was parsed successfully, and we will send the user a confirmation message
-    await message.channel.send(f"Updated {param} to {value}.")
-
-    # write updated channel configuration to .json in the config folder
     with open(f"./config/{message.channel.id}.json", "w") as f:
-        json.dump(
-            {
-                "system_message": system_message,
-                "max_response_tokens": max_response_tokens,
-                "temperature": temperature,
-                "recent_messages_length": recent_messages_length,
-                "relevant_messages_length": relevant_messages_length,
-                "chat_mode": chat_mode,
-            },
-            f,
-        )
+        json.dump({"chat_mode": new_chat_mode}, f)
+
+    await message.channel.send(f"Updated chat mode to {new_chat_mode}.")
+
+async def create_chat_mode_form(message):
+    view = View()
+    for mode in CHAT_MODE_PRESETS.keys():
+        button = Button(label=mode, style=discord.ButtonStyle.primary)
+        button.callback = lambda interaction, m=mode: handle_button_click(interaction, m)
+        view.add_item(button)
+
+    await message.channel.send("Choose a chat mode:", view=view)
+
+async def handle_button_click(interaction, mode):
+    await update_channel_configuration(interaction.message, mode)
+    await interaction.response.send_message(f"Chat mode updated to {mode}", ephemeral=True)
 
 async def reset_channel_configuration(message):
     # delete channel configuration file
@@ -586,34 +527,61 @@ async def reset_channel_configuration(message):
     # send confirmation message
     await message.channel.send("Channel configuration reset.")
 
+async def show_channel_configuration(message):
+    config = await get_channel_configuration(message)
+    formatted_config = format_channel_config(dict(zip(
+        ['system_message', 'max_response_tokens', 'temperature', 'recent_messages_length', 'relevant_messages_length', 'chat_mode'],
+        config
+    )))
+    await message.channel.send(formatted_config)
+
+def format_channel_config(config, chat_mode):
+    formatted = f"**Current Chat Mode: {chat_mode}**\n\n"
+    for key, value in config.items():
+        if key == 'system_message':
+            formatted += f"**{key}:**\n```\n{value}\n```\n"
+        else:
+            formatted += f"**{key}:** {value}\n"
+    return formatted
+
+
 async def get_query_terms(message):
-    # first we'll grab the most recent 5 messages from the channel including to the user's message
+    config, chat_mode = await get_channel_configuration(message)
+    
+    if chat_mode != "Memory":
+        return []
+
     recent_messages, _ = await retrieve_recent_messages(message, 1000, 6)
     recent_messages_string = "".join(recent_messages)
     timestamp = str(message.created_at)[:-16]
     user_message = f"[{timestamp}] {message.author.name}: {message.clean_content}"
 
-    messages = [
-        anthropic.Message(
-            role="system",
-            content=f"You are a discord chatbot named {bot_name}, you store messages from the conversation history into a vector database for semantic lookup to provide contextually relevant responses.",
-        ),
-        anthropic.Message(
-            role="user",
-            content=f"<recent messages> {recent_messages_string} {user_message}</recent messages> Based on the recent conversation, what are five key terms or topics that could be used to query the vector database",
-        ),
-    ]
+    system_content = f"""You are an AI assistant that extracts key terms for querying a vector database. 
+    Your task is to analyze the recent conversation and output up to 5 key terms or phrases, each on a new line. 
+    Only include terms that are directly relevant to the main topics of the conversation.
+    If there are fewer than 5 relevant topics, output fewer terms.
+    These terms should be concise and directly usable for database queries.
+    Do not include any explanations or additional text."""
+
+    user_content = f"Based on the following recent conversation, provide up to 5 key terms or phrases for querying a vector database:\n\n{recent_messages_string}{user_message}"
 
     response = anthropic_client.messages.create(
         model=model,
         max_tokens=100,
-        temperature=0.8,
-        messages=messages
+        temperature=0.7,
+        system=system_content,
+        messages=[
+            {"role": "user", "content": user_content}
+        ]
     )
 
     # Extract terms from the response
-    terms = [term.strip() for term in response.content.split(',')]
-    return terms[:5]  # Ensure we return at most 5 terms
+    terms = [term.strip() for term in response.content[0].text.strip().split('\n') if term.strip()]
+    
+    # Filter out any terms that are just numbers or single characters
+    terms = [term for term in terms if len(term) > 1 and not term.isdigit()]
+
+    return terms  # This will return all valid terms, up to 5
 
 async def generate_completion_messages(
     message,
@@ -621,21 +589,20 @@ async def generate_completion_messages(
     query_terms,
     recent_messages_length,
     relevant_messages_length,
+    sporadic_messages_length,
     chat_mode,
 ):
     # Map chat modes to corresponding retrieval functions
     retrieval_functions = {
-        "standard": [
+        "Default": [
+            ("recent messages", retrieve_recent_messages, False, False),
+        ],
+        "Memory": [
             ("recent messages", retrieve_recent_messages, False, False),
             ("relevant messages", retrieve_relevant_messages, True, True),
         ],
-        "gpt4": [
+        "Day Dream": [
             ("recent messages", retrieve_recent_messages, False, False),
-            ("relevant messages", retrieve_relevant_messages, True, True),
-        ],
-        "sporadic": [
-            ("recent messages", retrieve_recent_messages, False, False),
-            ("relevant messages", retrieve_relevant_messages, True, True),
             ("sporadic messages", retrieve_sporadic_messages, False, False),
         ],
     }
@@ -662,16 +629,12 @@ async def generate_completion_messages(
                 message, recent_messages_length
             )
             message_content = " ".join(recent_messages)
-        elif requires_query_terms and query_terms:
+        elif function == retrieve_relevant_messages:
             message_content = await function(
                 message, query_terms, relevant_messages_length, recent_message_ids
-            )
-        elif not requires_query_terms and requires_ids:
-            message_content = await function(
-                message, relevant_messages_length, recent_message_ids
-            )
-        elif not requires_query_terms and not requires_ids:
-            message_content = await function(message, relevant_messages_length)
+        )
+        elif function == retrieve_sporadic_messages:
+            message_content = await function(message, sporadic_messages_length)
         else:
             print(f"Skipping function for {tag} because query_terms is empty.")
             continue
@@ -689,18 +652,25 @@ async def generate_completion_messages(
         if content:
             assistant_message += f" {tag} {content} {tag.replace('<', '</')}"
 
+    # Construct the context message
+    context_message = "Chat context and history: "
+    for tag, content in message_tags.items():
+        if content:
+            context_message += f"{tag} {content} {tag.replace('<', '</')} "
+
     assistant_message += f" The time is {str(message.created_at)[:-16]}."
+    # Construct the message array
     messages = [
-        anthropic.Message(role="system", content=system_message),
-        anthropic.Message(role="assistant", content=assistant_message),
-        anthropic.Message(role="user", content=f"{message.clean_content}"),
+        {"role": "user", "content": context_message},
+        {"role": "assistant", "content": f"Thank you for providing the context. I'll keep that in mind for our conversation."},
+        {"role": "user", "content": message.clean_content}
     ]
 
     # Extract the recent and relevant messages from the message tags for the return statement
     recent_messages = message_tags.get("<recent messages>", "")
     relevant_messages = message_tags.get("<relevant messages>", "")
 
-    return messages, recent_messages, relevant_messages
+    return messages, recent_messages, relevant_messages, system_message
 
 async def do_nothing(*args, **kwargs):
     return ""
@@ -729,42 +699,33 @@ async def should_respond(message):
 
 # defines a helper function for handling responses.
 async def respond_to_message(message):
-    # sends the "typing" status to discord.
     async with message.channel.typing():
-        # fetches channel configuration
-        (
-            system_message,
-            max_response_tokens,
-            temperature,
-            recent_messages_length,
-            relevant_messages_length,
-            chat_mode,
-        ) = await get_channel_configuration(message)
-        # if chat_mode is standard, we'll fetch the query terms.
+        config, chat_mode = await get_channel_configuration(message)
+        
         query_terms = (
-            await get_query_terms(message) if chat_mode in {"standard", "gpt4"} else []
+            await get_query_terms(message) if chat_mode in {"Memory"} else []
         )
 
-        # we'll now generate the completion messages.
-        completion_messages, _, _ = await generate_completion_messages(
+        completion_messages, _, _, system_message = await generate_completion_messages(
             message,
-            system_message,
+            config["system_message"],
             query_terms,
-            recent_messages_length,
-            relevant_messages_length,
+            config["recent_messages_length"],
+            config["relevant_messages_length"],
+            config["sporadic_messages_length"],
             chat_mode,
         )
-        # gets the response via Anthropic API.
         response = await get_response(
             completion_messages,
-            max_response_tokens,
-            temperature,
+            config["system_message"],
+            config["max_response_tokens"],
+            config["temperature"],
         )
-        # sends the response message to discord.
         await send_long_discord_message(message, response)
 
 async def get_response(
     messages,
+    system_message,
     max_response_tokens,
     temperature,
 ):
@@ -773,9 +734,10 @@ async def get_response(
             model=model,
             max_tokens=max_response_tokens,
             temperature=temperature,
+            system=system_message,
             messages=messages
         )
-        return response.content
+        return response.content[0].text
 
     except anthropic.APIError as e:
         print(f"Anthropic API error: {e}")
@@ -791,11 +753,13 @@ def handle_exception(e):
 
 # defines a helper function that handles messages bigger than discord handles by default (nitro makes this redundant)
 async def send_long_discord_message(message, response):
+
+    # Replace escaped newlines with actual newlines
+    response = response.replace('\\n', '\n')
+
     if len(response) <= max_discord_message_length:
         await message.channel.send(response)
     else:
-        # split the response into lines no longer than max_discord_message_length
-        # break_long_words=False and replace_whitespace=False ensure words are not split
         parts = textwrap.wrap(
             response,
             max_discord_message_length,
