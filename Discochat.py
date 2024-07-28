@@ -18,6 +18,35 @@ import atexit
 from nltk.tokenize import word_tokenize
 from nltk.corpus import stopwords
 from collections import Counter
+import logging
+from logging.handlers import RotatingFileHandler
+import os
+
+# Set up logger
+logger = logging.getLogger('discochat')
+logger.setLevel(logging.DEBUG)
+
+# Create logs directory if it doesn't exist
+if not os.path.exists('logs'):
+    os.makedirs('logs')
+
+# Create file handler which logs even debug messages
+file_handler = RotatingFileHandler('logs/discochat.log', maxBytes=5*1024*1024, backupCount=5)
+file_handler.setLevel(logging.DEBUG)
+
+# Create console handler with a higher log level
+console_handler = logging.StreamHandler()
+console_handler.setLevel(logging.INFO)
+
+# Create formatter and add it to the handlers
+formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+file_handler.setFormatter(formatter)
+console_handler.setFormatter(formatter)
+
+# Add the handlers to the logger
+logger.addHandler(file_handler)
+logger.addHandler(console_handler)
+
 
 # Download nltk data
 nltk.download("stopwords")
@@ -206,97 +235,127 @@ def get_keywords(text, num_keywords=5):
     r.extract_keywords_from_text(text)
     return r.get_ranked_phrases()[0:num_keywords]
 
-async def retrieve_relevant_messages(
-    message, query_terms, token_length, recent_message_ids=None
-):
-    if recent_message_ids is None:
-        recent_message_ids = []
-    if not query_terms:
+def estimate_tokens(text):
+    # Rough estimation: 1 token ~= 4 characters
+    return len(text) // 4
+
+async def retrieve_relevant_messages(message, query_terms, token_length, recent_message_ids=None):
+    logger.info(f"Starting retrieve_relevant_messages for channel {message.channel.id}")
+    logger.debug(f"Query terms: {query_terms}")
+    logger.debug(f"Token length: {token_length}")
+    logger.debug(f"Recent message IDs: {recent_message_ids}")
+
+    if not query_terms or recent_message_ids is None:
+        logger.warning("No query terms or recent message IDs provided")
         return ""
-    query = []
-    # get keywords from message.clean_content, add these to the query list
-    query.extend(query_terms)
+
     channel = str(message.channel.id)
     distance_threshold = 0.7
-    bot_penalty = 0.4  # Adjust this to control how much bot messages are penalized
+    bot_penalty = 0.4
 
-    # Set the where conditions to only search in the channel
     where_conditions = {"$and": [{"channel": channel}, {"is_command": "False"}]}
 
-    relevant_messages = message_bank.query(
-        query_texts=query,
-        n_results=5,
-        where=where_conditions,
-    )
+    try:
+        relevant_messages = message_bank.query(
+            query_texts=query_terms,
+            n_results=5,
+            where=where_conditions,
+        )
+        logger.debug(f"Query results: {relevant_messages}")
+    except Exception as e:
+        logger.error(f"Error querying message bank: {e}", exc_info=True)
+        return ""
 
-    relevant_messages_result = ""
+    # More detailed check of query results
+    if not relevant_messages:
+        logger.warning("No relevant messages found (empty query result)")
+        return ""
+    
+    for key, value in relevant_messages.items():
+        if key != 'embeddings' and not value:  # Skip check for 'embeddings'
+            logger.warning(f"Incomplete query results: {key} is empty")
+            return ""
+        if key != 'embeddings':  # Only log non-embedding data
+            logger.debug(f"{key}: {value[:2]}...")  # Log first two items of each result list
 
-    seen_messages = set()
+    if len(relevant_messages['ids']) == 0:
+        logger.warning("No relevant messages found (no IDs in result)")
+        return ""
 
-    for i in range(len(query)):
-        ids = relevant_messages["ids"][i]
-        documents = relevant_messages["documents"][i]
-        metadatas = relevant_messages["metadatas"][i]
-        distances = relevant_messages["distances"][i]
+    relevant_messages_result = []
+    seen_messages = set(recent_message_ids)
 
-        for j in range(len(ids)):
-            if ids[j] in seen_messages or ids[j] in recent_message_ids:
+    async def fetch_messages(message_ids):
+        fetched_messages = []
+        for mid in message_ids:
+            if mid not in seen_messages:
+                try:
+                    msg = await message.channel.fetch_message(mid)
+                    fetched_messages.append(msg)
+                    logger.debug(f"Fetched message {mid}")
+                except discord.errors.NotFound:
+                    logger.warning(f"Message with id {mid} not found")
+                except Exception as e:
+                    logger.error(f"Error fetching message {mid}: {e}", exc_info=True)
+        return fetched_messages
+
+    for query_result in zip(*relevant_messages.values()):
+        message_id, document, metadata, distance = query_result
+        logger.debug(f"Processing query result: message_id={message_id}, distance={distance}")
+
+        if message_id in seen_messages:
+            logger.debug(f"Skipping already seen message {message_id}")
+            continue
+
+        seen_messages.add(message_id)
+
+        if metadata["author"] == bot_name:
+            distance += bot_penalty
+            logger.debug(f"Applied bot penalty to message {message_id}, new distance: {distance}")
+
+        if distance > distance_threshold:
+            logger.debug(f"Skipping message {message_id} due to distance {distance} > threshold {distance_threshold}")
+            continue
+
+        try:
+            messages = await fetch_messages([message_id])
+            if not messages:
+                logger.debug(f"No messages fetched for ID {message_id}")
+                continue
+            message_around = messages[0]
+        except Exception as e:
+            logger.error(f"Error fetching messages: {e}", exc_info=True)
+            continue
+
+        try:
+            near_messages = [msg async for msg in message.channel.history(limit=5, around=message_around, oldest_first=True)]
+            logger.debug(f"Fetched {len(near_messages)} near messages for message {message_id}")
+        except Exception as e:
+            logger.error(f"Error fetching message history: {e}", exc_info=True)
+            continue
+
+        for msg in near_messages:
+            if msg.id in seen_messages:
+                logger.debug(f"Skipping already seen near message {msg.id}")
                 continue
 
-            seen_messages.add(ids[j])
+            seen_messages.add(msg.id)
 
-            distance = distances[j]
-            if metadatas[j]["author"] == bot_name:
-                distance += bot_penalty  # Increase distance for bot messages
+            message_content = re.sub(r'\S{29,}', lambda m: m.group(0)[:28] + '...', msg.clean_content)
+            temp_string = f"[{str(msg.created_at)[:-16]}] {msg.author.name}: {message_content}, "
+            
+            estimated_tokens = estimate_tokens(temp_string)
+            if token_length - estimated_tokens < 0:
+                logger.debug(f"Token limit reached, breaking loop")
+                break
 
-            if distance <= distance_threshold:
-                message_id = ids[j]  # Discord message ID is stored in ids
+            relevant_messages_result.append(temp_string)
+            token_length -= estimated_tokens
+            logger.debug(f"Added message {msg.id} to results, remaining tokens: {token_length}")
 
-                # Fetch message object by id
-                message_around = None
-                try:
-                    message_around = await message.channel.fetch_message(message_id)
-
-                # Process the message
-                except discord.errors.NotFound:
-                    # Handle the error, skip this message, or perform any necessary action
-                    pass
-
-                near_messages = [
-                    msg
-                    async for msg in message.channel.history(
-                        limit=5, around=message_around, oldest_first=True
-                    )
-                ]
-
-                for msg in near_messages:
-                    if msg.id in seen_messages or msg.id in recent_message_ids:
-                        continue
-
-                    # we are going to split the message into words, and if any word is longer than 28 characters, we will truncate the word to that limit and add a "..." to the end
-                    # this is to prevent the model from crashing due to too many tokens
-                    message_content = msg.clean_content
-
-                    for word in message_content.split():
-                        if len(word) > 28:
-                            message_content = message_content.replace(
-                                word, word[:28] + "..."
-                            )
-
-                    seen_messages.add(msg.id)
-
-                    temp_string = f"[{str(msg.created_at)[:-16]}] {msg.author.name}: {message_content}, "
-                    current_message_tokens = len(temp_string)
-
-                    if current_message_tokens <= token_length:
-                        relevant_messages_result += temp_string
-                        token_length -= current_message_tokens
-                    else:
-                        break  # If adding next message would exceed token limit, break the loop
-
-    relevant_messages_result = relevant_messages_result[:-2]
-
-    return relevant_messages_result
+    result = "".join(relevant_messages_result)[:-2]
+    logger.info(f"retrieve_relevant_messages completed, returned {len(result)} characters")
+    return result
 
 async def retrieve_sporadic_messages(message, token_length):
     channel = str(message.channel.id)
@@ -402,41 +461,27 @@ def is_dm(message):
 
 # Defines a function that fetches most recent messages from discord based on the token length bounds.
 async def retrieve_recent_messages(message, token_length, limit=151):
-    # defines a list to store the history
     recent_messages = []
     recent_message_ids = [message.id]
-
-    message_number = 0
-    async for message in message.channel.history(limit=limit):
-        if message_number == 0:
-            message_number += 1
+    
+    async for msg in message.channel.history(limit=limit):
+        # Skip the first message (the command message)
+        if msg.id == message.id:
             continue
-        message_number += 1
+        
+        timestamp = str(msg.created_at)[:-16]
+        message_content = re.sub(r'\S{29,}', lambda m: m.group(0)[:28] + '...', msg.clean_content)
+        formatted_message = f"[{timestamp}] {msg.author.name}: {message_content} "
 
-        # for timestamp, we want to strip it back to a useful format
-        timestamp = str(message.created_at)[:-16]
-
-        message_content = message.clean_content
-        for word in message_content.split():
-            if len(word) > 28:
-                message_content = message_content.replace(word, word[:28] + "...")
-
-        formatted_message = f"[{timestamp}] {message.author.name}: {message_content} "
-
-        current_message_tokens = len(formatted_message)
-        if token_length - current_message_tokens < 0:
+        estimated_tokens = estimate_tokens(formatted_message)
+        if token_length - estimated_tokens < 0:
             break
 
-        # append formatted message to history
         recent_messages.append(formatted_message)
-        recent_message_ids.append(message.id)
+        recent_message_ids.append(msg.id)
+        token_length -= estimated_tokens
 
-        token_length -= current_message_tokens
-
-    # reverse the history list so that the messages are in chronological order.
-    recent_messages.reverse()
-    # returns the recent messages from the channel upto the length requested.
-    return recent_messages, recent_message_ids
+    return list(reversed(recent_messages)), recent_message_ids
 
 # in this function we are doing our initial populating of the database for the channel. this involves iterating through all prior messages,
 async def populate_database(message):
