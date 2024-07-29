@@ -3,6 +3,7 @@ import random
 import re
 import traceback
 import anthropic
+from anthropic import AsyncAnthropic
 import discord
 from discord.ui import View, Button
 import os
@@ -20,7 +21,7 @@ from nltk.corpus import stopwords
 from collections import Counter
 import logging
 from logging.handlers import RotatingFileHandler
-import os
+from datetime import datetime, timedelta
 
 # Set up logger
 logger = logging.getLogger('discochat')
@@ -30,8 +31,12 @@ logger.setLevel(logging.DEBUG)
 if not os.path.exists('logs'):
     os.makedirs('logs')
 
+# Generate a unique filename for this run
+current_time = datetime.now().strftime("%Y%m%d_%H%M%S")
+log_filename = f'logs/discochat_{current_time}.log'
+
 # Create file handler which logs even debug messages
-file_handler = RotatingFileHandler('logs/discochat.log', maxBytes=5*1024*1024, backupCount=5)
+file_handler = RotatingFileHandler(log_filename, maxBytes=5*1024*1024, backupCount=5)
 file_handler.setLevel(logging.DEBUG)
 
 # Create console handler with a higher log level
@@ -47,6 +52,8 @@ console_handler.setFormatter(formatter)
 logger.addHandler(file_handler)
 logger.addHandler(console_handler)
 
+# Log the start of the script
+logger.info(f"Script started. Logging to {log_filename}")
 
 # Download nltk data
 nltk.download("stopwords")
@@ -73,7 +80,7 @@ for variable in required_variables:
 TOKEN = os.getenv("DISCORD_TOKEN")
 
 # Set Anthropic API key
-anthropic_client = anthropic.Client(api_key=os.getenv("ANTHROPIC_API_KEY"))
+async_anthropic_client = AsyncAnthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
 
 bot_name = os.getenv("BOT_NAME")
 assert bot_name is not None, "Environment variable BOT_NAME is not set"
@@ -127,14 +134,15 @@ CHAT_MODE_PRESETS = {
         "temperature": 1.0
     },
     "Extended Memory": {
-        "recent_messages_length": 10000,  # Increased to capture more context
+        "recent_messages_length": 5000,  # Increased to capture more context
+        "summary_recent_messages_length": 10000,
         "relevant_messages_length": 10000,  # Increased to capture more relevant messages
         "sporadic_messages_length": 0,
         "max_response_tokens": 1000,
         "system_message": "You are a helpful AI assistant with access to an extended conversation history.",
         "temperature": 0.8,
         "summary_model": "claude-3-haiku-20240307",  # Use a smaller model for summarization
-        "summary_max_tokens": 500  # Limit the summary length
+        "summary_max_tokens": 800  # Limit the summary length
     }
 }
 
@@ -261,101 +269,163 @@ async def retrieve_relevant_messages(message, query_terms, token_length, recent_
             n_results=5,
             where=where_conditions,
         )
-        logger.debug(f"Query results: {relevant_messages}")
+        logger.debug(f"Raw query results: {relevant_messages}")
     except Exception as e:
         logger.error(f"Error querying message bank: {e}", exc_info=True)
         return ""
 
-    # More detailed check of query results
-    if not relevant_messages:
-        logger.warning("No relevant messages found (empty query result)")
+    # Check if relevant_messages is None or empty
+    if relevant_messages is None:
+        logger.warning("Query returned None")
         return ""
-    
-    for key, value in relevant_messages.items():
-        if key != 'embeddings' and not value:  # Skip check for 'embeddings'
-            logger.warning(f"Incomplete query results: {key} is empty")
-            return ""
-        if key != 'embeddings':  # Only log non-embedding data
-            logger.debug(f"{key}: {value[:2]}...")  # Log first two items of each result list
+    elif not relevant_messages:
+        logger.warning("Query returned empty result")
+        return ""
 
-    if len(relevant_messages['ids']) == 0:
-        logger.warning("No relevant messages found (no IDs in result)")
+    # Log the type and content of relevant_messages
+    logger.debug(f"Type of relevant_messages: {type(relevant_messages)}")
+    logger.debug(f"Keys in relevant_messages: {relevant_messages.keys()}")
+    
+    # Ensure all required keys are present and non-empty
+    required_keys = ['ids', 'documents', 'metadatas', 'distances']
+    for key in required_keys:
+        if key not in relevant_messages:
+            logger.warning(f"Missing required key in query results: {key}")
+            return ""
+        elif not relevant_messages[key]:
+            logger.warning(f"Empty list for key in query results: {key}")
+            return ""
+        logger.debug(f"{key}: {relevant_messages[key][:2]}...")  # Log first two items of each result list
+
+    # Validate that all lists have the same length
+    list_lengths = [len(relevant_messages[key]) for key in required_keys]
+    if len(set(list_lengths)) != 1:
+        logger.warning(f"Inconsistent list lengths in query results: {list_lengths}")
         return ""
 
     relevant_messages_result = []
     seen_messages = set(recent_message_ids)
 
-    async def fetch_messages(message_ids):
-        fetched_messages = []
-        for mid in message_ids:
-            if mid not in seen_messages:
-                try:
-                    msg = await message.channel.fetch_message(mid)
-                    fetched_messages.append(msg)
-                    logger.debug(f"Fetched message {mid}")
-                except discord.errors.NotFound:
-                    logger.warning(f"Message with id {mid} not found")
-                except Exception as e:
-                    logger.error(f"Error fetching message {mid}: {e}", exc_info=True)
-        return fetched_messages
+    try:
+        for i in range(len(relevant_messages['ids'])):
+            message_id = relevant_messages['ids'][i][0]  # Assuming 'ids' is a list of lists
+            document = relevant_messages['documents'][i][0]  # Assuming 'documents' is a list of lists
+            metadata = relevant_messages['metadatas'][i][0]  # Assuming 'metadatas' is a list of lists
+            distance = relevant_messages['distances'][i][0]  # Assuming 'distances' is a list of lists
 
-    for query_result in zip(*relevant_messages.values()):
-        message_id, document, metadata, distance = query_result
-        logger.debug(f"Processing query result: message_id={message_id}, distance={distance}")
+            logger.debug(f"Processing query result: message_id={message_id}, distance={distance}")
 
-        if message_id in seen_messages:
-            logger.debug(f"Skipping already seen message {message_id}")
-            continue
-
-        seen_messages.add(message_id)
-
-        if metadata["author"] == bot_name:
-            distance += bot_penalty
-            logger.debug(f"Applied bot penalty to message {message_id}, new distance: {distance}")
-
-        if distance > distance_threshold:
-            logger.debug(f"Skipping message {message_id} due to distance {distance} > threshold {distance_threshold}")
-            continue
-
-        try:
-            messages = await fetch_messages([message_id])
-            if not messages:
-                logger.debug(f"No messages fetched for ID {message_id}")
-                continue
-            message_around = messages[0]
-        except Exception as e:
-            logger.error(f"Error fetching messages: {e}", exc_info=True)
-            continue
-
-        try:
-            near_messages = [msg async for msg in message.channel.history(limit=5, around=message_around, oldest_first=True)]
-            logger.debug(f"Fetched {len(near_messages)} near messages for message {message_id}")
-        except Exception as e:
-            logger.error(f"Error fetching message history: {e}", exc_info=True)
-            continue
-
-        for msg in near_messages:
-            if msg.id in seen_messages:
-                logger.debug(f"Skipping already seen near message {msg.id}")
+            if message_id in seen_messages:
+                logger.debug(f"Skipping already seen message {message_id}")
                 continue
 
-            seen_messages.add(msg.id)
+            seen_messages.add(message_id)
 
-            message_content = re.sub(r'\S{29,}', lambda m: m.group(0)[:28] + '...', msg.clean_content)
-            temp_string = f"[{str(msg.created_at)[:-16]}] {msg.author.name}: {message_content}, "
-            
-            estimated_tokens = estimate_tokens(temp_string)
-            if token_length - estimated_tokens < 0:
-                logger.debug(f"Token limit reached, breaking loop")
-                break
+            if metadata["author"] == bot_name:
+                distance += bot_penalty
+                logger.debug(f"Applied bot penalty to message {message_id}, new distance: {distance}")
 
-            relevant_messages_result.append(temp_string)
-            token_length -= estimated_tokens
-            logger.debug(f"Added message {msg.id} to results, remaining tokens: {token_length}")
+            if distance > distance_threshold:
+                logger.debug(f"Skipping message {message_id} due to distance {distance} > threshold {distance_threshold}")
+                continue
+
+            try:
+                message_around = await message.channel.fetch_message(message_id)
+                logger.debug(f"Fetched message {message_id}")
+            except discord.errors.NotFound:
+                logger.warning(f"Message with id {message_id} not found")
+                continue
+            except Exception as e:
+                logger.error(f"Error fetching message {message_id}: {e}", exc_info=True)
+                continue
+
+            try:
+                near_messages = [msg async for msg in message.channel.history(limit=5, around=message_around, oldest_first=True)]
+                logger.debug(f"Fetched {len(near_messages)} near messages for message {message_id}")
+            except Exception as e:
+                logger.error(f"Error fetching message history: {e}", exc_info=True)
+                continue
+
+            for msg in near_messages:
+                if msg.id in seen_messages:
+                    logger.debug(f"Skipping already seen near message {msg.id}")
+                    continue
+
+                seen_messages.add(msg.id)
+
+                message_content = re.sub(r'\S{29,}', lambda m: m.group(0)[:28] + '...', msg.clean_content)
+                temp_string = f"[{str(msg.created_at)[:-16]}] {msg.author.name}: {message_content}, "
+                
+                estimated_tokens = estimate_tokens(temp_string)
+                if token_length - estimated_tokens < 0:
+                    logger.debug(f"Token limit reached, breaking loop")
+                    break
+
+                relevant_messages_result.append(temp_string)
+                token_length -= estimated_tokens
+                logger.debug(f"Added message {msg.id} to results, remaining tokens: {token_length}")
+
+    except Exception as e:
+        logger.error(f"Error processing query results: {e}", exc_info=True)
+        return ""
 
     result = "".join(relevant_messages_result)[:-2]
     logger.info(f"retrieve_relevant_messages completed, returned {len(result)} characters")
     return result
+
+def get_relative_time(timestamp_str, current_time):
+    timestamp = datetime.strptime(timestamp_str, "%Y-%m-%d %H:%M")
+    delta = current_time - timestamp
+    
+    if delta.days == 0:
+        if delta.seconds < 60:
+            return "just now"
+        elif delta.seconds < 3600:
+            return f"{delta.seconds // 60} minutes ago"
+        else:
+            return f"{delta.seconds // 3600} hours ago"
+    elif delta.days == 1:
+        return "yesterday"
+    elif delta.days < 7:
+        return f"{delta.days} days ago"
+    elif delta.days < 30:
+        return f"{delta.days // 7} weeks ago"
+    elif delta.days < 365:
+        return f"{delta.days // 30} months ago"
+    else:
+        return f"{delta.days // 365} years ago"
+
+def process_messages(messages, message_type, current_time):
+    processed = []
+    last_timestamp = None
+    group = []
+    significant_time_gap = timedelta(hours=1)
+
+    for line in messages.split('\n'):
+        if line.startswith('['):
+            parts = line.split(']', 1)
+            if len(parts) == 2:
+                timestamp_str = parts[0][1:]
+                content = parts[1].strip()
+                timestamp = datetime.strptime(timestamp_str, "%Y-%m-%d %H:%M")
+                
+                if last_timestamp and (timestamp - last_timestamp > significant_time_gap):
+                    if group:
+                        processed.append((group, get_relative_time(last_timestamp.strftime("%Y-%m-%d %H:%M"), current_time)))
+                        group = []
+                    processed.append(f"[{get_relative_time(timestamp_str, current_time)}]")
+                
+                username, message = content.split(':', 1)
+                group.append((username.strip(), message.strip(), timestamp_str))
+                last_timestamp = timestamp
+        else:
+            if group:
+                group[-1] = (group[-1][0], group[-1][1] + " " + line.strip(), group[-1][2])
+
+    if group:
+        processed.append((group, get_relative_time(last_timestamp.strftime("%Y-%m-%d %H:%M"), current_time)))
+
+    return processed
 
 async def retrieve_sporadic_messages(message, token_length):
     channel = str(message.channel.id)
@@ -399,10 +469,10 @@ async def retrieve_sporadic_messages(message, token_length):
 # Defines a function that stores relevant messages in a dictionary.
 def summarize(input_text, summary_length=500):
     messages = [
-        anthropic.Message(role="user", content=f"summarize these messages: {input_text}"),
+        AsyncAnthropic.Message(role="user", content=f"summarize these messages: {input_text}"),
     ]
 
-    summary = anthropic_client.messages.create(
+    summary = async_anthropic_client.messages.create(
         model=model,
         max_tokens=summary_length,
         messages=messages
@@ -412,38 +482,121 @@ def summarize(input_text, summary_length=500):
 # Defines a function that stores relevant messages in a dictionary.
 def summarize_for_context(recent_messages, relevant_messages, summary_length=500):
     messages = [
-        anthropic.Message(
+        AsyncAnthropic.Message(
             role="user",
             content=f"summarize the recalled messages based on what is relevant to the conversation in recent messages. \
         <recalled messages> {relevant_messages} </recalled messages> <recent messages> {recent_messages} </recent messages>."
         ),
     ]
 
-    summary = anthropic_client.messages.create(
+    summary = async_anthropic_client.messages.create(
         model=model,
         max_tokens=summary_length,
         messages=messages
     )
     return summary.content
 
-async def summarize_extended_context(recent_messages, relevant_messages, summary_model, summary_max_tokens):
-    context = f"Recent messages:\n{recent_messages}\n\nRelevant messages:\n{relevant_messages}"
-    
-    system_content = "You are an AI assistant tasked with summarizing conversation context. Provide a concise summary that captures the key points and context of the conversation."
-    
-    user_content = f"Please summarize the following conversation context, focusing on the most important information and maintaining continuity:\n\n{context}"
+async def summarize_extended_context(all_recent_messages, relevant_messages, summary_model, summary_max_tokens, full_recent_messages_count):
+    current_time = datetime.now()
+    logger.info(f"Summarizing extended context. Current time: {current_time}")
 
-    response = anthropic_client.messages.create(
-        model=summary_model,
-        max_tokens=summary_max_tokens,
-        temperature=0.7,
-        system=system_content,
-        messages=[
-            {"role": "user", "content": user_content}
-        ]
-    )
+    # Create a unique filename for this summary input
+    timestamp = current_time.strftime("%Y%m%d_%H%M%S_%f")
+    filename = f"summary_input_{timestamp}.txt"
+    log_dir = "logs/summary_inputs"
+    os.makedirs(log_dir, exist_ok=True)
+    file_path = os.path.join(log_dir, filename)
 
-    return response.content[0].text
+    async def summarize_block(block, block_type, max_tokens):
+        system_content = f"""You are assisting the chatbot "{bot_name}" by summarizing a block of {block_type} messages.
+        Create a concise summary of the provided content without adding new information or interpretations.
+        Focus on key points, topics, and information present in the given text.
+        Use bullet points to structure your summary."""
+
+        user_content = f"""Summarize this block of {block_type} messages:
+
+        {block}
+
+        Provide a concise summary focusing on main topics and key information.
+        Label notes with user names for clarity.
+        The current date and time is {current_time.strftime("%Y-%m-%d %H:%M")}.
+        Use relative time information if provided to give context on when these conversations occurred.
+        """
+
+        response = await async_anthropic_client.messages.create(
+            model=summary_model,
+            max_tokens=max_tokens,
+            temperature=0.1,
+            system=system_content,
+            messages=[{"role": "user", "content": user_content}]
+        )
+
+        return response.content[0].text
+
+    # Split recent messages
+    recent_messages_full = all_recent_messages[-full_recent_messages_count:]
+    older_recent_messages = all_recent_messages[:-full_recent_messages_count]
+    
+    # Split relevant messages into blocks
+    relevant_blocks = [block.strip() for block in relevant_messages.split('],') if block.strip()]
+    
+    # Calculate token allocations
+    older_recent_tokens = summary_max_tokens // 2
+    if relevant_blocks:
+        relevant_tokens_per_block = (summary_max_tokens - older_recent_tokens) // len(relevant_blocks)
+    else:
+        relevant_tokens_per_block = 0
+
+    # Create tasks for parallel summarization
+    tasks = [
+        summarize_block("".join(older_recent_messages), "older recent", older_recent_tokens),
+        *[summarize_block(block + ']', "semantically relevant", relevant_tokens_per_block) for block in relevant_blocks]
+    ]
+
+    # Log the summary input
+    with open(file_path, "w", encoding="utf-8") as f:
+        f.write(f"Summary input for {current_time}\n\n")
+        f.write(f"Older recent messages:\n{''.join(older_recent_messages)}\n\n")
+        for i, block in enumerate(relevant_blocks):
+            f.write(f"Relevant block {i+1}:\n{block}\n\n")
+
+    logger.info(f"Saved summary input to {file_path}")
+
+    # Run summaries in parallel
+    summaries = await asyncio.gather(*tasks)
+
+    # Log the summaries
+    with open(file_path, "a", encoding="utf-8") as f:
+        f.write("Summaries:\n\n")
+        f.write(f"Older recent messages summary:\n{summaries[0]}\n\n")
+        for i, summary in enumerate(summaries[1:]):
+            f.write(f"Relevant block {i+1} summary:\n{summary}\n\n")
+
+    # Combine summaries
+    older_recent_summary = summaries[0]
+    relevant_summaries = summaries[1:]
+
+    # Format summaries
+    formatted_relevant_summaries = "\n".join(relevant_summaries)
+
+    combined_summary = f"""<older recent messages summary>
+{older_recent_summary}
+</older recent messages summary>
+
+<semantically relevant messages summary>
+{formatted_relevant_summaries}
+</semantically relevant messages summary>"""
+
+    logger.info(f"Generated parallel extended context summaries")
+    logger.debug(f"Combined summary:\n{combined_summary}")
+    
+    return post_process_summary(combined_summary), recent_messages_full
+
+def post_process_summary(summary):
+    # Remove any lines that appear to be continuing the conversation
+    lines = summary.split('\n')
+    processed_lines = [line for line in lines if not line.strip().startswith(('I ', 'You ', 'We ', 'Please ', 'Let me '))]
+    return '\n'.join(processed_lines)
 
 # Defines a helper function that retrieves the strings from "previous_relevant_messages" for the channel and returns the string.
 def retrieve_previously_relevant_messages(message):
@@ -670,7 +823,7 @@ async def get_detailed_query_terms(message):
 
     user_content = f"Based on the following recent conversation, provide up to 5 key terms or phrases for querying a vector database:\n\n{recent_messages_string}{user_message}"
 
-    response = anthropic_client.messages.create(
+    response = async_anthropic_client.messages.create(
         model=model,
         max_tokens=100,
         temperature=0.7,
@@ -697,81 +850,41 @@ async def generate_completion_messages(
     sporadic_messages_length,
     chat_mode,
 ):
-    # Map chat modes to corresponding retrieval functions
-    retrieval_functions = {
-        "Default": [
-            ("recent messages", retrieve_recent_messages, False, False),
-        ],
-        "Memory": [
-            ("recent messages", retrieve_recent_messages, False, False),
-            ("relevant messages", retrieve_relevant_messages, True, True),
-        ],
-        "Day Dream": [
-            ("recent messages", retrieve_recent_messages, False, False),
-            ("sporadic messages", retrieve_sporadic_messages, False, False),
-        ],
-        "Extended Memory": [
-            ("recent messages", retrieve_recent_messages, False, False),
-            ("relevant messages", retrieve_relevant_messages, True, True),
-        ],
-    }
+    config, _ = await get_channel_configuration(message)
 
-    # Generate message tags
-    message_tags = {}
-
-    # Initialize recent_message_ids
-    recent_message_ids = []
-
-    print(f"Chat mode: {chat_mode}")  # Print the chat mode
-    print(f"Query terms: {query_terms}")  # Print the query terms
-
-    # Get messages based on chat mode
-    functions_for_mode = retrieval_functions.get(
-        chat_mode, [("default", do_nothing, False, False)]
+    # Retrieve recent messages
+    all_recent_messages, recent_message_ids = await retrieve_recent_messages(
+        message, config["summary_recent_messages_length"]
     )
-    for tag, function, requires_ids, requires_query_terms in functions_for_mode:
-        print(f"Function for mode: {function.__name__}")  # Print the function that should be called
-        if function == retrieve_recent_messages:
-            recent_messages, recent_message_ids = await function(
-                message, recent_messages_length
-            )
-            message_content = " ".join(recent_messages)
-        elif function == retrieve_relevant_messages:
-            message_content = await function(
-                message, query_terms, relevant_messages_length, recent_message_ids
-            )
-        elif function == retrieve_sporadic_messages:
-            message_content = await function(message, sporadic_messages_length)
-        else:
-            print(f"Skipping function for {tag} because query_terms is empty.")
-            continue
+    
+    # Retrieve semantically relevant messages
+    relevant_messages = await retrieve_relevant_messages(
+        message, query_terms, relevant_messages_length, recent_message_ids
+    )
 
-        print(f"Function for {tag} returned: {message_content}")  # Print the content that was returned
+    # Define the number of full recent messages to include
+    full_recent_messages_count = 25  # Adjust this value as needed
 
-        if message_content:  # Check if the content is not empty
-            message_tags[f"<{tag}>"] = message_content
+    # Retrieve sporadic messages if in Day Dream mode
+    sporadic_messages = ""
+    if chat_mode == "Day Dream":
+        sporadic_messages = await retrieve_sporadic_messages(message, sporadic_messages_length)
+
+    summary, recent_messages_full = await summarize_extended_context(
+        all_recent_messages,
+        relevant_messages,
+        config["summary_model"],
+        config["summary_max_tokens"],
+        full_recent_messages_count
+    )
 
     # Construct the context message
     context_message = f"I am an AI assistant talking to the user: {message.author.name}. The current time is {str(message.created_at)[:-16]}. "
+    context_message += f"Extended conversation summary: {summary}\n\n"
+    context_message += "Recent messages:\n" + "".join(recent_messages_full)
 
-    # Add the most recent messages directly to the context
-    recent_context = "\n".join(recent_messages[-5:])  # Include the 5 most recent messages
-    context_message += f"Here are the most recent messages:\n{recent_context}\n\n"
-
-    if chat_mode == "Extended Memory":
-        config = CHAT_MODE_PRESETS["Extended Memory"]
-        summary = await summarize_extended_context(
-            message_tags.get("<recent messages>", ""),
-            message_tags.get("<relevant messages>", ""),
-            config["summary_model"],
-            config["summary_max_tokens"]
-        )
-        context_message += f"Extended conversation summary: {summary}"
-    else:
-        context_message += "Additional chat context and history: "
-        for tag, content in message_tags.items():
-            if content:
-                context_message += f"{tag} {content} {tag.replace('<', '</')} "
+    if sporadic_messages:
+        context_message += f"\n\n<sporadic messages> {sporadic_messages} </sporadic messages>"
 
     # Construct the message array
     messages = [
@@ -780,11 +893,16 @@ async def generate_completion_messages(
         {"role": "user", "content": message.clean_content}
     ]
 
-    # Extract the recent and relevant messages from the message tags for the return statement
-    recent_messages = message_tags.get("<recent messages>", "")
-    relevant_messages = message_tags.get("<relevant messages>", "")
+    return messages, recent_messages_full, relevant_messages, system_message
 
-    return messages, recent_messages, relevant_messages, system_message
+# Helper function to format messages (if needed)
+def format_messages(messages):
+    formatted = []
+    for msg in messages:
+        timestamp = str(msg.created_at)[:-16]
+        content = re.sub(r'\S{29,}', lambda m: m.group(0)[:28] + '...', msg.clean_content)
+        formatted.append(f"[{timestamp}] {msg.author.name}: {content}")
+    return formatted
 
 async def do_nothing(*args, **kwargs):
     return ""
@@ -841,8 +959,29 @@ async def get_response(
     max_response_tokens,
     temperature,
 ):
+    # Create a unique filename based on the current timestamp
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    filename = f"response_input_{timestamp}.txt"
+    
+    # Ensure the logs directory exists
+    log_dir = "logs/response_inputs"
+    os.makedirs(log_dir, exist_ok=True)
+    
+    # Full path for the log file
+    file_path = os.path.join(log_dir, filename)
+    
+    # Write the system message and messages to the file
+    with open(file_path, "w", encoding="utf-8") as f:
+        f.write("SYSTEM MESSAGE:\n")
+        f.write(f"{system_message}\n\n")
+        f.write("MESSAGES:\n")
+        json.dump(messages, f, indent=2, ensure_ascii=False)
+        f.write("\n")
+    
+    logger.info(f"Saved response input to {file_path}")
+
     try:
-        response = anthropic_client.messages.create(
+        response = await async_anthropic_client.messages.create(
             model=model,
             max_tokens=max_response_tokens,
             temperature=temperature,
@@ -852,16 +991,16 @@ async def get_response(
         return response.content[0].text
 
     except anthropic.APIError as e:
-        print(f"Anthropic API error: {e}")
+        logger.error(f"Anthropic API error: {e}")
         return "Sorry, there was an issue with the request. Please try again later."
 
-    except Exception as e:  # This will catch any other exceptions
-        print(f"Non-API error occurred: {e}")
+    except Exception as e:
+        logger.error(f"Non-API error occurred: {e}", exc_info=True)
         return "Sorry, an unexpected error occurred. Please try again later."
 
+# Modify the error handling to use the logger
 def handle_exception(e):
-    print(f"Error occurred: {e} \n")
-    traceback.print_exc()
+    logger.error(f"Error occurred: {e}", exc_info=True)
 
 # defines a helper function that handles messages bigger than discord handles by default (nitro makes this redundant)
 async def send_long_discord_message(message, response):
@@ -885,9 +1024,8 @@ async def send_long_discord_message(message, response):
 
 # defines a function that prints a message to the console when the discord bot is ready
 async def on_ready():
-    print(f"{client.user} has connected to Discord!")
-    # Add a print statement to display connected servers
-    print(f"Connected servers: {', '.join([guild.name for guild in client.guilds])}")
+    logger.info(f"{client.user} has connected to Discord!")
+    logger.info(f"Connected servers: {', '.join([guild.name for guild in client.guilds])}")
 
 # Add the event handlers to the client
 client.event(on_ready)
@@ -900,12 +1038,12 @@ try:
     else:
         raise ValueError("TOKEN is not set.")
 except ValueError as e:
-    print(str(e))
+    logger.critical(str(e))
 
 # defines a function that saves the chroma database to disk.
 def save_database():
     chromadb_client.persist()
-    pass
+    logger.info("Database saved. Script is ending.")
 
 # saves the database on exit (workaround for https://github.com/chroma-core/chroma/issues/622)
 atexit.register(save_database)
