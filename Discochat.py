@@ -22,6 +22,7 @@ from collections import Counter
 import logging
 from logging.handlers import RotatingFileHandler
 from datetime import datetime, timedelta
+from collections import Counter
 
 # Set up logger
 logger = logging.getLogger('discochat')
@@ -41,7 +42,7 @@ file_handler.setLevel(logging.DEBUG)
 
 # Create console handler with a higher log level
 console_handler = logging.StreamHandler()
-console_handler.setLevel(logging.INFO)
+console_handler.setLevel(logging.DEBUG)
 
 # Create formatter and add it to the handlers
 formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -239,6 +240,80 @@ def extract_message_data(message):
 
     return message_id, content, metadata
 
+def cleanup_database():
+    logger.info("Starting database cleanup process")
+    all_messages = message_bank.get()
+    low_quality_ids = []
+    total_messages = len(all_messages['ids'])
+    failed_deletions = []
+
+    logger.info(f"Total messages in database: {total_messages}")
+
+    for i, (document, metadata) in enumerate(zip(all_messages['documents'], all_messages['metadatas'])):
+        if not is_quality_content(document, metadata):
+            low_quality_ids.append(all_messages['ids'][i])
+        
+        if i % 1000 == 0:
+            logger.info(f"Processed {i+1}/{total_messages} messages")
+
+    if low_quality_ids:
+        logger.info(f"Attempting to remove {len(low_quality_ids)} low-quality entries from the database")
+        for id_to_delete in low_quality_ids:
+            try:
+                message_bank.delete(ids=[id_to_delete])
+            except KeyError:
+                failed_deletions.append(id_to_delete)
+                logger.warning(f"Failed to delete message with ID: {id_to_delete}")
+            except Exception as e:
+                failed_deletions.append(id_to_delete)
+                logger.error(f"Error deleting message with ID {id_to_delete}: {str(e)}")
+
+        successfully_deleted = len(low_quality_ids) - len(failed_deletions)
+        logger.info(f"Successfully removed {successfully_deleted} low-quality entries from the database")
+        if failed_deletions:
+            logger.warning(f"Failed to delete {len(failed_deletions)} entries. IDs: {failed_deletions}")
+    else:
+        logger.info("No low-quality entries found in the database")
+
+    logger.info("Database cleanup process completed")
+
+def is_quality_content(text, metadata):
+    # Remove any non-alphanumeric characters and split into words
+    words = re.findall(r'\w+', text.lower())
+    
+    # Count total words and unique words
+    total_words = len(words)
+    unique_words = len(set(words))
+    
+    # Calculate word diversity ratio
+    diversity_ratio = unique_words / total_words if total_words > 0 else 0
+
+    # Check for repetitive patterns
+    word_counts = Counter(words)
+    max_repetition = max(word_counts.values()) if word_counts else 0
+    repetition_ratio = max_repetition / total_words if total_words > 0 else 1
+
+    # Check metadata for spam indicators
+    is_spam = 'spam' in metadata.get('keywords', '').lower()
+
+    # Log the quality metrics for debugging
+    logger.debug(f"Message quality metrics - Total words: {total_words}, Unique words: {unique_words}, "
+                 f"Diversity ratio: {diversity_ratio:.2f}, Repetition ratio: {repetition_ratio:.2f}, "
+                 f"Is spam: {is_spam}")
+
+    # Determine if the content is low quality
+    is_low_quality = (
+        total_words < 5 or
+        diversity_ratio < 0.4 or
+        repetition_ratio > 0.5 or
+        is_spam
+    )
+
+    if is_low_quality:
+        logger.debug(f"Low quality message detected: {text[:100]}...")
+
+    return not is_low_quality
+
 def get_keywords(text, num_keywords=5):
     r.extract_keywords_from_text(text)
     return r.get_ranked_phrases()[0:num_keywords]
@@ -258,15 +333,15 @@ async def retrieve_relevant_messages(message, query_terms, token_length, recent_
         return ""
 
     channel = str(message.channel.id)
-    distance_threshold = 0.7
+    distance_threshold = 0.85
     bot_penalty = 0.4
-
+    
     where_conditions = {"$and": [{"channel": channel}, {"is_command": "False"}]}
 
     try:
         relevant_messages = message_bank.query(
             query_texts=query_terms,
-            n_results=5,
+            n_results=10,
             where=where_conditions,
         )
         logger.debug(f"Raw query results: {relevant_messages}")
@@ -274,30 +349,19 @@ async def retrieve_relevant_messages(message, query_terms, token_length, recent_
         logger.error(f"Error querying message bank: {e}", exc_info=True)
         return ""
 
-    # Check if relevant_messages is None or empty
-    if relevant_messages is None:
-        logger.warning("Query returned None")
-        return ""
-    elif not relevant_messages:
-        logger.warning("Query returned empty result")
+    if relevant_messages is None or not relevant_messages:
+        logger.warning("Query returned None or empty result")
         return ""
 
-    # Log the type and content of relevant_messages
     logger.debug(f"Type of relevant_messages: {type(relevant_messages)}")
     logger.debug(f"Keys in relevant_messages: {relevant_messages.keys()}")
     
-    # Ensure all required keys are present and non-empty
     required_keys = ['ids', 'documents', 'metadatas', 'distances']
     for key in required_keys:
-        if key not in relevant_messages:
-            logger.warning(f"Missing required key in query results: {key}")
+        if key not in relevant_messages or not relevant_messages[key]:
+            logger.warning(f"Missing or empty required key in query results: {key}")
             return ""
-        elif not relevant_messages[key]:
-            logger.warning(f"Empty list for key in query results: {key}")
-            return ""
-        logger.debug(f"{key}: {relevant_messages[key][:2]}...")  # Log first two items of each result list
 
-    # Validate that all lists have the same length
     list_lengths = [len(relevant_messages[key]) for key in required_keys]
     if len(set(list_lengths)) != 1:
         logger.warning(f"Inconsistent list lengths in query results: {list_lengths}")
@@ -305,13 +369,14 @@ async def retrieve_relevant_messages(message, query_terms, token_length, recent_
 
     relevant_messages_result = []
     seen_messages = set(recent_message_ids)
+    quality_messages_count = 0
 
     try:
         for i in range(len(relevant_messages['ids'])):
-            message_id = relevant_messages['ids'][i][0]  # Assuming 'ids' is a list of lists
-            document = relevant_messages['documents'][i][0]  # Assuming 'documents' is a list of lists
-            metadata = relevant_messages['metadatas'][i][0]  # Assuming 'metadatas' is a list of lists
-            distance = relevant_messages['distances'][i][0]  # Assuming 'distances' is a list of lists
+            message_id = relevant_messages['ids'][i][0]
+            document = relevant_messages['documents'][i][0]
+            metadata = relevant_messages['metadatas'][i][0]
+            distance = relevant_messages['distances'][i][0]
 
             logger.debug(f"Processing query result: message_id={message_id}, distance={distance}")
 
@@ -327,6 +392,10 @@ async def retrieve_relevant_messages(message, query_terms, token_length, recent_
 
             if distance > distance_threshold:
                 logger.debug(f"Skipping message {message_id} due to distance {distance} > threshold {distance_threshold}")
+                continue
+
+            if not is_quality_content(document, metadata):
+                logger.debug(f"Skipping low-quality message {message_id}")
                 continue
 
             try:
@@ -346,6 +415,7 @@ async def retrieve_relevant_messages(message, query_terms, token_length, recent_
                 logger.error(f"Error fetching message history: {e}", exc_info=True)
                 continue
 
+            block_messages = []
             for msg in near_messages:
                 if msg.id in seen_messages:
                     logger.debug(f"Skipping already seen near message {msg.id}")
@@ -361,16 +431,24 @@ async def retrieve_relevant_messages(message, query_terms, token_length, recent_
                     logger.debug(f"Token limit reached, breaking loop")
                     break
 
-                relevant_messages_result.append(temp_string)
+                block_messages.append(temp_string)
                 token_length -= estimated_tokens
-                logger.debug(f"Added message {msg.id} to results, remaining tokens: {token_length}")
+                logger.debug(f"Added message {msg.id} to block, remaining tokens: {token_length}")
+
+            if block_messages:
+                relevant_messages_result.append("".join(block_messages)[:-2])
+                quality_messages_count += 1
+
+            if quality_messages_count >= 5:
+                logger.debug(f"Reached 5 quality message blocks, stopping retrieval")
+                break
 
     except Exception as e:
         logger.error(f"Error processing query results: {e}", exc_info=True)
         return ""
 
-    result = "".join(relevant_messages_result)[:-2]
-    logger.info(f"retrieve_relevant_messages completed, returned {len(result)} characters")
+    result = "\n\n".join(relevant_messages_result)
+    logger.info(f"retrieve_relevant_messages completed, returned {len(result)} characters in {quality_messages_count} blocks")
     return result
 
 def get_relative_time(timestamp_str, current_time):
@@ -466,39 +544,9 @@ async def retrieve_sporadic_messages(message, token_length):
     sporadic_messages_result = sporadic_messages_result[:-2]
     return sporadic_messages_result
 
-# Defines a function that stores relevant messages in a dictionary.
-def summarize(input_text, summary_length=500):
-    messages = [
-        AsyncAnthropic.Message(role="user", content=f"summarize these messages: {input_text}"),
-    ]
-
-    summary = async_anthropic_client.messages.create(
-        model=model,
-        max_tokens=summary_length,
-        messages=messages
-    )
-    return summary.content
-
-# Defines a function that stores relevant messages in a dictionary.
-def summarize_for_context(recent_messages, relevant_messages, summary_length=500):
-    messages = [
-        AsyncAnthropic.Message(
-            role="user",
-            content=f"summarize the recalled messages based on what is relevant to the conversation in recent messages. \
-        <recalled messages> {relevant_messages} </recalled messages> <recent messages> {recent_messages} </recent messages>."
-        ),
-    ]
-
-    summary = async_anthropic_client.messages.create(
-        model=model,
-        max_tokens=summary_length,
-        messages=messages
-    )
-    return summary.content
-
 async def summarize_extended_context(all_recent_messages, relevant_messages, summary_model, summary_max_tokens, full_recent_messages_count):
     current_time = datetime.now()
-    logger.info(f"Summarizing extended context. Current time: {current_time}")
+    logger.info(f"Starting extended context summarization. Current time: {current_time}")
 
     # Create a unique filename for this summary input
     timestamp = current_time.strftime("%Y%m%d_%H%M%S_%f")
@@ -540,6 +588,9 @@ async def summarize_extended_context(all_recent_messages, relevant_messages, sum
     # Split relevant messages into blocks
     relevant_blocks = [block.strip() for block in relevant_messages.split('],') if block.strip()]
     
+    # Log the number of relevant blocks
+    logger.info(f"Number of relevant blocks: {len(relevant_blocks)}")
+    
     # Calculate token allocations
     older_recent_tokens = summary_max_tokens // 2
     if relevant_blocks:
@@ -561,6 +612,7 @@ async def summarize_extended_context(all_recent_messages, relevant_messages, sum
             f.write(f"Relevant block {i+1}:\n{block}\n\n")
 
     logger.info(f"Saved summary input to {file_path}")
+    logger.info(f"Generating {len(tasks)} summaries: 1 for older recent messages and {len(tasks) - 1} for relevant blocks")
 
     # Run summaries in parallel
     summaries = await asyncio.gather(*tasks)
@@ -587,7 +639,9 @@ async def summarize_extended_context(all_recent_messages, relevant_messages, sum
 {formatted_relevant_summaries}
 </semantically relevant messages summary>"""
 
-    logger.info(f"Generated parallel extended context summaries")
+    logger.info(f"Generated {len(summaries)} parallel extended context summaries:")
+    logger.info(f"  - 1 summary for older recent messages")
+    logger.info(f"  - {len(relevant_summaries)} summaries for semantically relevant blocks")
     logger.debug(f"Combined summary:\n{combined_summary}")
     
     return post_process_summary(combined_summary), recent_messages_full
@@ -1033,6 +1087,7 @@ client.event(on_message)
 
 # Run the bot
 try:
+    cleanup_database()
     if TOKEN is not None:
         client.run(TOKEN)
     else:
