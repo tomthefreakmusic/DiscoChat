@@ -23,6 +23,9 @@ import logging
 from logging.handlers import RotatingFileHandler
 from datetime import datetime, timedelta
 from collections import Counter
+import fal_client
+import io
+import aiohttp
 
 # Set up logger
 logger = logging.getLogger('discochat')
@@ -71,6 +74,7 @@ required_variables = [
     "DATABASE_DIRECTORY",
     "DEV_NAME",
     "SERVER_WHITELIST",
+    "FAL_KEY",
 ]
 
 for variable in required_variables:
@@ -79,6 +83,8 @@ for variable in required_variables:
         exit(1)
 
 TOKEN = os.getenv("DISCORD_TOKEN")
+
+FAL_KEY = os.getenv("FAL_KEY")
 
 # Set Anthropic API key
 async_anthropic_client = AsyncAnthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
@@ -120,7 +126,7 @@ CHAT_MODE_PRESETS = {
 Available context:
 1. Recent messages: You have access to the most recent messages in the conversation, up to 2000 tokens. These messages provide immediate context for the ongoing discussion.
 
-Remember to stay on topic and refer to the recent messages when appropriate. If you're unsure about something, don't hesitate to ask for clarification.""",
+Remember to stay on topic and refer to the recent messages when appropriate. If you're unsure about something, don't hesitate to ask for clarification. Respond in a conversational manner and avoid using lists unless requested.""",
         "temperature": 0.8
     },
     "Memory": {
@@ -134,7 +140,7 @@ Available context:
 1. Recent messages: You have access to the most recent messages in the conversation, up to 2000 tokens. These messages provide immediate context for the ongoing discussion.
 2. Relevant messages: You have access to semantically relevant messages from past conversations, up to 2000 tokens. These messages provide additional context related to the current topic.
 
-Use the combination of recent and relevant messages to provide more informed and contextually appropriate responses. When referencing past conversations, be clear about the time frame (e.g., "As we discussed earlier" or "In a previous conversation about this topic"). If you're unsure about the continuity of a conversation, don't hesitate to ask for clarification.""",
+Use the combination of recent and relevant messages to provide more informed and contextually appropriate responses. When referencing past conversations, be clear about the time frame (e.g., "As we discussed earlier" or "In a previous conversation about this topic"). If you're unsure about the continuity of a conversation, don't hesitate to ask for clarification. Respond in a conversational manner and avoid using lists unless requested.""",
         "temperature": 0.8
     },
     "Day Dream": {
@@ -148,7 +154,7 @@ Available context:
 1. Recent messages: You have access to the most recent messages in the conversation, up to 1000 tokens. These messages provide immediate context for the ongoing discussion.
 2. Sporadic messages: You have access to random messages from past conversations, up to 3000 tokens. These messages are not necessarily related to the current topic and can serve as inspiration for creative tangents.
 
-Feel free to make creative connections between the current conversation and the sporadic messages. Use these unexpected associations to spark interesting discussions, make analogies, or introduce new perspectives. However, always ensure your responses remain relevant to the user's input and the overall conversation flow. If your creative connections seem too abstract, explain your thought process to keep the user engaged.""",
+Feel free to make creative connections between the current conversation and the sporadic messages. Use these unexpected associations to spark interesting discussions, make analogies, or introduce new perspectives. However, always ensure your responses remain relevant to the user's input and the overall conversation flow. If your creative connections seem too abstract, explain your thought process to keep the user engaged. Respond in a conversational manner and avoid using lists unless requested.""",
         "temperature": 1.0
     },
     "Extended Memory": {
@@ -171,7 +177,7 @@ Use this rich context to provide highly informed and contextually appropriate re
 - If you're referring to information from the summary, you can say something like "From what I understand of our earlier conversation..."
 - For very recent context, you can refer to it directly as you have the full text.
 
-If there are any inconsistencies between the summary and recent messages, prioritize the most recent information. If you're unsure about any details or need clarification, don't hesitate to ask the user. Your goal is to maintain a coherent, informed, and engaging conversation that builds upon the rich history you have access to.""",
+If there are any inconsistencies between the summary and recent messages, prioritize the most recent information. If you're unsure about any details or need clarification, don't hesitate to ask the user. Your goal is to maintain a coherent, informed, and engaging conversation that builds upon the rich history you have access to. Respond in a conversational manner and avoid using lists unless requested.""",
         "temperature": 0.8,
         "summary_model": "claude-3-haiku-20240307",
         "summary_max_tokens": 800,
@@ -188,14 +194,20 @@ previously_relevant_messages = {}
 # sets maximum message length (if you have nitro this could be increased)
 max_discord_message_length = 2000
 
-# Set discord intents
+class CustomClient(discord.Client):
+    def __init__(self, *, intents: discord.Intents):
+        super().__init__(intents=intents)
+        self.tree = discord.app_commands.CommandTree(self)
+
+    async def setup_hook(self):
+        await self.tree.sync()
+
 intents = discord.Intents.default()
 intents.messages = True
 intents.guild_messages = True
 intents.message_content = True
 
-# Sets the client variable
-client = discord.Client(intents=intents)
+client = CustomClient(intents=intents)
 
 # Initialize Rake
 r = Rake()
@@ -751,22 +763,52 @@ def count_channel_database(message):
 
     return num_messages
 
-def check_permissions(message):
-    # check if the user has the required role to use the bot, {bot_name} being the role name.
-    # if the user is in a whitelisted server, we don't need to check for roles.
-    # if the user is messaging in DMs, we don't need to check for roles.
-    if is_dm(message):
-        return True
-    if message.guild.name in server_whitelist:
-        return True
-    else:
-        # iterate through the roles of the user, checking if they have the required role.
-        for role in message.author.roles:
-            if role.name == bot_name:
-                return True
-        # if the user is the bot then we don't need to check for roles.
-        if message.author == client.user:
+def check_permissions(obj):
+    try:
+        if isinstance(obj, discord.Interaction):
+            user = obj.user
+            guild = obj.guild
+            channel = obj.channel
+        elif isinstance(obj, discord.Message):
+            user = obj.author
+            guild = obj.guild
+            channel = obj.channel
+        else:
+            logger.error(f"Unsupported object type in check_permissions: {type(obj)}")
+            return False
+
+        user_name = user.name if user else "Unknown User"
+        guild_name = guild.name if guild else "DM"
+        channel_type = type(channel).__name__ if channel else "Unknown Channel"
+
+        logger.debug(f"Checking permissions for user: {user_name}, guild: {guild_name}, channel_type: {channel_type}")
+
+        # Check if it's a DM
+        if isinstance(channel, discord.DMChannel) or guild is None:
+            logger.info(f"Allowing command in DM for user: {user_name}")
             return True
+
+        # For servers, check whitelist and roles
+        if guild_name in server_whitelist:
+            logger.info(f"Allowing command for user: {user_name} in whitelisted guild: {guild_name}")
+            return True
+
+        if user and user.roles:
+            for role in user.roles:
+                if role.name == bot_name:
+                    logger.info(f"Allowing command for user: {user_name} with role: {bot_name}")
+                    return True
+
+        # Check if the user is the bot itself
+        if user == client.user:
+            logger.info(f"Allowing command for bot user")
+            return True
+
+        logger.info(f"Denied permission for user: {user_name} in guild: {guild_name}")
+        return False
+
+    except Exception as e:
+        logger.error(f"Error in check_permissions: {str(e)}", exc_info=True)
         return False
 
 # Defines a helper function that checks if the message is a command, if it is, it runs the relevant function.
@@ -858,6 +900,59 @@ def format_channel_config(config, chat_mode):
         else:
             formatted += f"**{key}:** {value}\n"
     return formatted
+
+@client.tree.command()
+async def generate_image(interaction: discord.Interaction, prompt: str):
+    try:
+        user_name = interaction.user.name if interaction.user else "Unknown User"
+        channel_type = type(interaction.channel).__name__ if interaction.channel else "Unknown Channel"
+        guild_name = interaction.guild.name if interaction.guild else "DM"
+
+        logger.info(f"Received generate_image command from {user_name} in {guild_name}")
+        logger.debug(f"Interaction details: channel_type={channel_type}, guild={guild_name}")
+
+        if not check_permissions(interaction):
+            logger.warning(f"Permission denied for user {user_name} in {guild_name}")
+            await interaction.response.send_message("You don't have permission to use this command.", ephemeral=True)
+            return
+
+        await interaction.response.defer()
+
+        handler = fal_client.submit(
+            "fal-ai/flux-pro",
+            arguments={
+                "prompt": prompt,
+                "num_images": 1,
+                "guidance_scale": 3.5,
+                "num_inference_steps": 28,
+            },
+        )
+
+        result = handler.get()
+
+        image_url = result['images'][0]['url']
+        expanded_prompt = result['prompt']
+
+        async with aiohttp.ClientSession() as session:
+            async with session.get(image_url) as resp:
+                if resp.status != 200:
+                    logger.error(f"Failed to download image. Status: {resp.status}")
+                    await interaction.followup.send("An error occurred while downloading the image.")
+                    return
+                image_data = await resp.read()
+
+        await interaction.followup.send(
+            f"Generated image for prompt: '{prompt}'",
+            file=discord.File(io.BytesIO(image_data), filename="generated_image.png")
+        )
+        logger.info(f"Successfully generated and sent image for user {user_name}")
+
+    except AttributeError as e:
+        logger.error(f"AttributeError in generate_image: {str(e)}", exc_info=True)
+        await interaction.followup.send("An error occurred while processing your command. Please try again later.")
+    except Exception as e:
+        logger.error(f"Unexpected error in generate_image: {str(e)}", exc_info=True)
+        await interaction.followup.send("An unexpected error occurred. Please try again later.")
 
 async def get_query_terms(message, chat_mode):
     config, _ = await get_channel_configuration(message)
@@ -1171,8 +1266,17 @@ async def on_ready():
     logger.info(f"Connected servers: {', '.join([guild.name for guild in client.guilds])}")
 
 # Add the event handlers to the client
-client.event(on_ready)
-client.event(on_message)
+@client.event
+async def on_message(message):
+    if check_permissions(message):
+        store_message(message)
+        try:
+            if await is_command(message):
+                await handle_command(message)
+            elif await should_respond(message):
+                await respond_to_message(message)
+        except Exception as e:
+            handle_exception(e)
 
 # Run the bot
 try:
