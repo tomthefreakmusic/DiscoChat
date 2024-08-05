@@ -5,6 +5,7 @@ import traceback
 import anthropic
 from anthropic import AsyncAnthropic
 import discord
+from discord import app_commands
 from discord.ui import View, Button
 import os
 import asyncio
@@ -211,6 +212,8 @@ client = CustomClient(intents=intents)
 
 # Initialize Rake
 r = Rake()
+
+user_configs = {}
 
 # setup chroma and the collection (message_bank)
 chromadb_client = chromadb.Client(
@@ -901,59 +904,219 @@ def format_channel_config(config, chat_mode):
             formatted += f"**{key}:** {value}\n"
     return formatted
 
-@client.tree.command()
-async def generate_image(interaction: discord.Interaction, prompt: str):
-    try:
-        user_name = interaction.user.name if interaction.user else "Unknown User"
-        channel_type = type(interaction.channel).__name__ if interaction.channel else "Unknown Channel"
-        guild_name = interaction.guild.name if interaction.guild else "DM"
+DEFAULT_CONFIG = {
+    "image_size": "landscape_16_9",
+    "model": "fal-ai/flux-pro",
+    "num_inference_steps": 28,
+    "num_images": 1,
+    "guidance_scale": 3.5
+}
 
-        logger.info(f"Received generate_image command from {user_name} in {guild_name}")
-        logger.debug(f"Interaction details: channel_type={channel_type}, guild={guild_name}")
+class ConfigView(discord.ui.View):
+    def __init__(self, user_id):
+        super().__init__()
+        self.user_id = user_id
+        self.config = load_user_config(user_id)
+        self.add_item(ImageSizeSelect(self.config.get('image_size', DEFAULT_CONFIG['image_size'])))
+        self.add_item(ModelSelect(self.config.get('model', DEFAULT_CONFIG['model'])))
 
-        if not check_permissions(interaction):
-            logger.warning(f"Permission denied for user {user_name} in {guild_name}")
-            await interaction.response.send_message("You don't have permission to use this command.", ephemeral=True)
+    @discord.ui.button(label="Set Inference Steps", style=discord.ButtonStyle.primary)
+    async def set_inference_steps(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(InferenceStepsModal(self))
+
+    @discord.ui.button(label="Set Number of Images", style=discord.ButtonStyle.primary)
+    async def set_num_images(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(NumImagesModal(self))
+
+    @discord.ui.button(label="Set Guidance Scale", style=discord.ButtonStyle.primary)
+    async def set_guidance_scale(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(GuidanceScaleModal(self))
+
+    @discord.ui.button(label="Save Configuration", style=discord.ButtonStyle.success)
+    async def save_config(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not all([self.config.get('image_size'), self.config.get('model'), 
+                    self.config.get('num_inference_steps'), 
+                    self.config.get('num_images'),
+                    self.config.get('guidance_scale')]):
+            await interaction.response.send_message("Please set all configuration options before saving.", ephemeral=True)
             return
 
-        await interaction.response.defer()
+        save_user_config(self.user_id, self.config)
+        await interaction.response.send_message("Configuration saved successfully!", ephemeral=True)
+        self.stop()
 
+class ImageSizeSelect(discord.ui.Select):
+    def __init__(self, default):
+        options = [
+            discord.SelectOption(label="Square HD", value="square_hd"),
+            discord.SelectOption(label="Square", value="square"),
+            discord.SelectOption(label="Portrait 4:3", value="portrait_4_3"),
+            discord.SelectOption(label="Portrait 16:9", value="portrait_16_9"),
+            discord.SelectOption(label="Landscape 4:3", value="landscape_4_3"),
+            discord.SelectOption(label="Landscape 16:9", value="landscape_16_9"),
+        ]
+        super().__init__(placeholder="Select image size", options=options)
+        self.default = default
+
+    async def callback(self, interaction: discord.Interaction):
+        await interaction.response.defer()
+        self.view.config['image_size'] = self.values[0]
+        await interaction.followup.send(f"Image size set to {self.values[0]}", ephemeral=True)
+
+class ModelSelect(discord.ui.Select):
+    def __init__(self, default):
+        options = [
+            discord.SelectOption(label="Flux Pro", value="fal-ai/flux-pro"),
+            discord.SelectOption(label="Flux Schnell", value="fal-ai/flux/schnell"),
+            discord.SelectOption(label="Flux Dev", value="fal-ai/flux/dev"),
+        ]
+        super().__init__(placeholder="Select model", options=options)
+        self.default = default
+
+    async def callback(self, interaction: discord.Interaction):
+        await interaction.response.defer()
+        self.view.config['model'] = self.values[0]
+        await interaction.followup.send(f"Model set to {self.values[0]}", ephemeral=True)
+
+class InferenceStepsModal(discord.ui.Modal, title='Set Inference Steps'):
+    steps = discord.ui.TextInput(label='Inference Steps', default='28')
+
+    def __init__(self, view):
+        super().__init__()
+        self.view = view
+        self.steps.default = str(view.config.get('num_inference_steps', DEFAULT_CONFIG['num_inference_steps']))
+
+    async def on_submit(self, interaction: discord.Interaction):
+        try:
+            steps = int(self.steps.value)
+            if steps <= 0:
+                raise ValueError
+        except ValueError:
+            await interaction.response.send_message("Please enter a positive integer for inference steps.", ephemeral=True)
+            return
+
+        self.view.config['num_inference_steps'] = steps
+        await interaction.response.send_message(f"Inference steps set to {steps}.", ephemeral=True)
+
+
+class NumImagesModal(discord.ui.Modal, title='Set Number of Images'):
+    num_images = discord.ui.TextInput(label='Number of Images', default='1')
+
+    def __init__(self, view):
+        super().__init__()
+        self.view = view
+        self.num_images.default = str(view.config.get('num_images', DEFAULT_CONFIG['num_images']))
+
+    async def on_submit(self, interaction: discord.Interaction):
+        try:
+            num = int(self.num_images.value)
+            if num <= 0:
+                raise ValueError
+        except ValueError:
+            await interaction.response.send_message("Please enter a positive integer for number of images.", ephemeral=True)
+            return
+
+        self.view.config['num_images'] = num
+        await interaction.response.send_message(f"Number of images set to {num}.", ephemeral=True)
+
+class GuidanceScaleModal(discord.ui.Modal, title='Set Guidance Scale'):
+    guidance_scale = discord.ui.TextInput(label='Guidance Scale', default='3.5')
+
+    def __init__(self, view):
+        super().__init__()
+        self.view = view
+        self.guidance_scale.default = str(view.config.get('guidance_scale', DEFAULT_CONFIG['guidance_scale']))
+
+    async def on_submit(self, interaction: discord.Interaction):
+        try:
+            scale = float(self.guidance_scale.value)
+            if scale <= 0:
+                raise ValueError
+        except ValueError:
+            await interaction.response.send_message("Please enter a positive number for guidance scale.", ephemeral=True)
+            return
+
+        self.view.config['guidance_scale'] = scale
+        await interaction.response.send_message(f"Guidance scale set to {scale}.", ephemeral=True)
+
+@client.tree.command()
+async def configure_image_gen(interaction: discord.Interaction):
+    """Configure your image generation settings"""
+    if not check_permissions(interaction):
+        logger.warning(f"Permission denied for user {interaction.user.name} in {interaction.guild.name if interaction.guild else 'DM'}")
+        await interaction.response.send_message("You don't have permission to use this command.", ephemeral=True)
+        return
+
+    view = ConfigView(interaction.user.id)
+    await interaction.response.send_message("Please configure your image generation settings:", view=view, ephemeral=True)
+
+@client.tree.command()
+@app_commands.describe(prompt="The prompt for image generation")
+async def generate_image(interaction: discord.Interaction, prompt: str):
+    """Generate an image based on the provided prompt and your configuration"""
+    if not check_permissions(interaction):
+        logger.warning(f"Permission denied for user {interaction.user.name} in {interaction.guild.name if interaction.guild else 'DM'}")
+        await interaction.response.send_message("You don't have permission to use this command.", ephemeral=True)
+        return
+
+    await interaction.response.defer()
+
+    # Load user configuration, falling back to defaults if not set
+    config = load_user_config(interaction.user.id)
+    
+    # Use default values for any missing configuration items
+    for key, default_value in DEFAULT_CONFIG.items():
+        if key not in config:
+            config[key] = default_value
+
+    try:
         handler = fal_client.submit(
-            "fal-ai/flux-pro",
+            config['model'],
             arguments={
                 "prompt": prompt,
-                "num_images": 1,
-                "guidance_scale": 3.5,
-                "num_inference_steps": 28,
+                "image_size": config['image_size'],
+                "num_inference_steps": config['num_inference_steps'],
+                "num_images": config['num_images'],
+                "guidance_scale": config['guidance_scale'],
             },
         )
 
         result = handler.get()
 
-        image_url = result['images'][0]['url']
-        expanded_prompt = result['prompt']
+        for i, image_info in enumerate(result['images']):
+            image_url = image_info['url']
+            async with aiohttp.ClientSession() as session:
+                async with session.get(image_url) as resp:
+                    if resp.status != 200:
+                        logger.error(f"Failed to download image {i+1}. Status: {resp.status}")
+                        await interaction.followup.send(f"An error occurred while downloading image {i+1}.")
+                        continue
+                    image_data = await resp.read()
 
-        async with aiohttp.ClientSession() as session:
-            async with session.get(image_url) as resp:
-                if resp.status != 200:
-                    logger.error(f"Failed to download image. Status: {resp.status}")
-                    await interaction.followup.send("An error occurred while downloading the image.")
-                    return
-                image_data = await resp.read()
+            await interaction.followup.send(
+                f"Generated image {i+1} for prompt: '{prompt}'",
+                file=discord.File(io.BytesIO(image_data), filename=f"generated_image_{i+1}.png")
+            )
 
-        await interaction.followup.send(
-            f"Generated image for prompt: '{prompt}'",
-            file=discord.File(io.BytesIO(image_data), filename="generated_image.png")
-        )
-        logger.info(f"Successfully generated and sent image for user {user_name}")
+        logger.info(f"Successfully generated and sent {config['num_images']} image(s) for user {interaction.user.name}")
 
-    except AttributeError as e:
-        logger.error(f"AttributeError in generate_image: {str(e)}", exc_info=True)
-        await interaction.followup.send("An error occurred while processing your command. Please try again later.")
     except Exception as e:
-        logger.error(f"Unexpected error in generate_image: {str(e)}", exc_info=True)
-        await interaction.followup.send("An unexpected error occurred. Please try again later.")
+        logger.error(f"Error generating images: {str(e)}", exc_info=True)
+        await interaction.followup.send("An error occurred while generating the images. Please try again.")
 
+def save_user_config(user_id, config):
+    if not os.path.exists('user_configs'):
+        os.makedirs('user_configs')
+    
+    with open(f'user_configs/{user_id}.json', 'w') as f:
+        json.dump(config, f)
+
+def load_user_config(user_id):
+    if os.path.exists(f'user_configs/{user_id}.json'):
+        with open(f'user_configs/{user_id}.json', 'r') as f:
+            return json.load(f)
+    return {}
+            
 async def get_query_terms(message, chat_mode):
     config, _ = await get_channel_configuration(message)
     
