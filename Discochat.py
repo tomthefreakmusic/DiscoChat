@@ -2,12 +2,12 @@ import json
 import random
 import re
 import traceback
+from typing import Literal
 import anthropic
 from anthropic import AsyncAnthropic
 import discord
 from discord import app_commands
 from discord.ui import View, Button
-from discord import Embed
 import os
 import asyncio
 import chromadb
@@ -32,6 +32,9 @@ import asyncio
 import io
 from PIL import Image
 from PIL.PngImagePlugin import PngInfo
+from io import BytesIO
+
+from chat_mode_presets import CHAT_MODE_PRESETS
 
 # Set up logger
 logger = logging.getLogger('discochat')
@@ -121,75 +124,7 @@ else:
 # sets the model.
 model = "claude-3-5-sonnet-20240620"
 
-CHAT_MODE_PRESETS = {
-    "Default": {
-        "recent_messages_length": 2000,
-        "relevant_messages_length": 0,
-        "sporadic_messages_length": 0,
-        "max_response_tokens": 1000,
-        "system_message": """You are a helpful AI assistant named {bot_name}. You're engaging in a conversation on a Discord server. Your responses should be friendly, informative, and tailored to the context of the conversation.
 
-Available context:
-1. Recent messages: You have access to the most recent messages in the conversation, up to 2000 tokens. These messages provide immediate context for the ongoing discussion.
-
-Remember to stay on topic and refer to the recent messages when appropriate. If you're unsure about something, don't hesitate to ask for clarification. Respond in a conversational manner and avoid using lists unless requested.""",
-        "temperature": 0.8
-    },
-    "Memory": {
-        "recent_messages_length": 2000,
-        "relevant_messages_length": 2000,
-        "sporadic_messages_length": 0,
-        "max_response_tokens": 1000,
-        "system_message": """You are a helpful AI assistant named {bot_name} with enhanced memory capabilities. You're engaging in a conversation on a Discord server. Your responses should be friendly, informative, and demonstrate awareness of both recent and past relevant discussions.
-
-Available context:
-1. Recent messages: You have access to the most recent messages in the conversation, up to 2000 tokens. These messages provide immediate context for the ongoing discussion.
-2. Relevant messages: You have access to semantically relevant messages from past conversations, up to 2000 tokens. These messages provide additional context related to the current topic.
-
-Use the combination of recent and relevant messages to provide more informed and contextually appropriate responses. When referencing past conversations, be clear about the time frame (e.g., "As we discussed earlier" or "In a previous conversation about this topic"). If you're unsure about the continuity of a conversation, don't hesitate to ask for clarification. Respond in a conversational manner and avoid using lists unless requested.""",
-        "temperature": 0.8
-    },
-    "Day Dream": {
-        "recent_messages_length": 1000,
-        "relevant_messages_length": 0,
-        "sporadic_messages_length": 3000,
-        "max_response_tokens": 1000,
-        "system_message": """You are a creative and imaginative AI assistant named {bot_name}. You're engaging in a conversation on a Discord server. Your responses should be friendly, creative, and occasionally draw inspiration from seemingly unrelated past conversations.
-
-Available context:
-1. Recent messages: You have access to the most recent messages in the conversation, up to 1000 tokens. These messages provide immediate context for the ongoing discussion.
-2. Sporadic messages: You have access to random messages from past conversations, up to 3000 tokens. These messages are not necessarily related to the current topic and can serve as inspiration for creative tangents.
-
-Feel free to make creative connections between the current conversation and the sporadic messages. Use these unexpected associations to spark interesting discussions, make analogies, or introduce new perspectives. However, always ensure your responses remain relevant to the user's input and the overall conversation flow. If your creative connections seem too abstract, explain your thought process to keep the user engaged. Respond in a conversational manner and avoid using lists unless requested.""",
-        "temperature": 1.0
-    },
-    "Extended Memory": {
-        "recent_messages_length": 5000,
-        "summary_recent_messages_length": 10000,
-        "relevant_messages_length": 10000,
-        "sporadic_messages_length": 0,
-        "max_response_tokens": 1000,
-        "system_message": """You are an advanced AI assistant named {bot_name} with extended memory and summarization capabilities. You're engaging in a conversation on a Discord server. Your responses should be friendly, informative, and demonstrate a deep understanding of the conversation's context and history.
-
-Available context:
-1. Recent messages: You have access to the most recent messages in the conversation, providing immediate context.
-2. Extended conversation summary: You have a summary of the extended conversation history, which includes:
-   a. A summary of older recent messages
-   b. Summaries of semantically relevant message blocks from past conversations
-3. Full recent messages: You have access to the full text of the most recent messages (typically the last 25 messages).
-
-Use this rich context to provide highly informed and contextually appropriate responses. When referencing past conversations or the extended history:
-- Be clear about the time frame (e.g., "As we discussed earlier" or "Based on our conversation history").
-- If you're referring to information from the summary, you can say something like "From what I understand of our earlier conversation..."
-- For very recent context, you can refer to it directly as you have the full text.
-
-If there are any inconsistencies between the summary and recent messages, prioritize the most recent information. If you're unsure about any details or need clarification, don't hesitate to ask the user. Your goal is to maintain a coherent, informed, and engaging conversation that builds upon the rich history you have access to. Respond in a conversational manner and avoid using lists unless requested.""",
-        "temperature": 0.8,
-        "summary_model": "claude-3-haiku-20240307",
-        "summary_max_tokens": 800,
-        "query_model": "claude-3-haiku-20240307"
-    }
-}
 
 # sets the minimum messages required to be stored before relevant messages can be retrieved.
 min_messages_threshold = 5
@@ -1144,6 +1079,70 @@ async def process_image_generation(interaction: discord.Interaction, prompt: str
         logger.error(f"Error generating images: {str(e)}", exc_info=True)
         await interaction.followup.send("An error occurred while generating the images. Please try again.")
 
+@client.tree.command()
+@app_commands.describe(
+    image="The image to upscale (attach an image)",
+    image_url="URL of the image to upscale (if not attaching)",
+    upscaling_factor="Upscaling factor (currently only 4x is supported)",
+    overlapping_tiles="Use overlapping tiles to reduce seams (slower)",
+    checkpoint="Checkpoint to use for upscaling"
+)
+async def upscale(
+    interaction: discord.Interaction,
+    image: discord.Attachment = None,
+    image_url: str = None,
+    upscaling_factor: Literal["4"] = "4",
+    overlapping_tiles: bool = False,
+    checkpoint: Literal["v1", "v2"] = "v2"
+):
+    """Upscale an image using auraSR"""
+    if not check_permissions(interaction):
+        logger.warning(f"Permission denied for user {interaction.user.name} in {interaction.guild.name if interaction.guild else 'DM'}")
+        await interaction.response.send_message("You don't have permission to use this command.", ephemeral=True)
+        return
+
+    await interaction.response.defer()
+
+    if not image and not image_url:
+        await interaction.followup.send("Please provide an image or an image URL.")
+        return
+
+    if image:
+        image_url = image.url
+
+    try:
+        handler = fal_client.submit(
+            "fal-ai/aura-sr",
+            arguments={
+                "image_url": image_url,
+                "upscaling_factor": int(upscaling_factor),
+                "overlapping_tiles": overlapping_tiles,
+                "checkpoint": checkpoint
+            },
+        )
+
+        result = await asyncio.to_thread(handler.get)
+
+        upscaled_image_url = result['image']['url']
+
+        # Download the upscaled image
+        async with aiohttp.ClientSession() as session:
+            async with session.get(upscaled_image_url) as resp:
+                if resp.status != 200:
+                    await interaction.followup.send("An error occurred while downloading the upscaled image.")
+                    return
+                image_data = await resp.read()
+
+        # Create a file object from the image data
+        file = discord.File(BytesIO(image_data), filename="upscaled_image.png")
+
+        # Send the upscaled image
+        await interaction.followup.send(f"Here's your upscaled image:", file=file)
+
+    except Exception as e:
+        logger.error(f"Error upscaling image: {str(e)}", exc_info=True)
+        await interaction.followup.send("An error occurred while upscaling the image. Please try again.")
+
 def save_user_config(user_id, config):
     if not os.path.exists('user_configs'):
         os.makedirs('user_configs')
@@ -1489,9 +1488,17 @@ async def send_long_discord_message(message, response):
             await asyncio.sleep(1)
 
 # defines a function that prints a message to the console when the discord bot is ready
+@client.event
 async def on_ready():
     logger.info(f"{client.user} has connected to Discord!")
     logger.info(f"Connected servers: {', '.join([guild.name for guild in client.guilds])}")
+    
+    # Sync the command tree
+    try:
+        synced = await client.tree.sync()
+        logger.info(f"Synced {len(synced)} command(s)")
+    except Exception as e:
+        logger.error(f"Failed to sync command tree: {e}", exc_info=True)
 
 # Add the event handlers to the client
 @client.event
