@@ -7,6 +7,7 @@ from anthropic import AsyncAnthropic
 import discord
 from discord import app_commands
 from discord.ui import View, Button
+from discord import Embed
 import os
 import asyncio
 import chromadb
@@ -27,6 +28,10 @@ from collections import Counter
 import fal_client
 import io
 import aiohttp
+import asyncio
+import io
+from PIL import Image
+from PIL.PngImagePlugin import PngInfo
 
 # Set up logger
 logger = logging.getLogger('discochat')
@@ -46,7 +51,7 @@ file_handler.setLevel(logging.DEBUG)
 
 # Create console handler with a higher log level
 console_handler = logging.StreamHandler()
-console_handler.setLevel(logging.DEBUG)
+console_handler.setLevel(logging.INFO)
 
 # Create formatter and add it to the handlers
 formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -606,7 +611,7 @@ async def summarize_extended_context(all_recent_messages, relevant_messages, sum
         system_content = f"""You are assisting the chatbot "{bot_name}" by summarizing a block of {block_type} messages.
         Create a concise summary of the provided content without adding new information or interpretations.
         Focus on key points, topics, and information present in the given text.
-        Use bullet points to structure your summary."""
+        Do not use lists or bullet points to structure your summary."""
 
         user_content = f"""Summarize this block of {block_type} messages:
 
@@ -909,7 +914,8 @@ DEFAULT_CONFIG = {
     "model": "fal-ai/flux-pro",
     "num_inference_steps": 28,
     "num_images": 1,
-    "guidance_scale": 3.5
+    "guidance_scale": 3.5,
+    "enhance_prompt": False
 }
 
 class ConfigView(discord.ui.View):
@@ -919,6 +925,12 @@ class ConfigView(discord.ui.View):
         self.config = load_user_config(user_id)
         self.add_item(ImageSizeSelect(self.config.get('image_size', DEFAULT_CONFIG['image_size'])))
         self.add_item(ModelSelect(self.config.get('model', DEFAULT_CONFIG['model'])))
+
+    @discord.ui.button(label="Toggle Prompt Enhancement", style=discord.ButtonStyle.primary)
+    async def toggle_prompt_enhancement(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.config['enhance_prompt'] = not self.config.get('enhance_prompt', False)
+        status = "enabled" if self.config['enhance_prompt'] else "disabled"
+        await interaction.response.send_message(f"Prompt enhancement {status}.", ephemeral=True)
 
     @discord.ui.button(label="Set Inference Steps", style=discord.ButtonStyle.primary)
     async def set_inference_steps(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -1061,7 +1073,7 @@ async def generate_image(interaction: discord.Interaction, prompt: str):
 
     await interaction.response.defer()
 
-    # Load user configuration, falling back to defaults if not set
+    # Load user configuration
     config = load_user_config(interaction.user.id)
     
     # Use default values for any missing configuration items
@@ -1069,11 +1081,23 @@ async def generate_image(interaction: discord.Interaction, prompt: str):
         if key not in config:
             config[key] = default_value
 
+    # Start the image generation process in a separate task
+    client.loop.create_task(process_image_generation(interaction, prompt, config))
+
+    await interaction.followup.send("Image generation started. Please wait...")
+
+async def process_image_generation(interaction: discord.Interaction, prompt: str, config: dict):
     try:
+        # Enhance the prompt if the option is enabled
+        if config['enhance_prompt']:
+            enhanced_prompt = await enhance_prompt(prompt)
+        else:
+            enhanced_prompt = prompt
+
         handler = fal_client.submit(
             config['model'],
             arguments={
-                "prompt": prompt,
+                "prompt": enhanced_prompt,
                 "image_size": config['image_size'],
                 "num_inference_steps": config['num_inference_steps'],
                 "num_images": config['num_images'],
@@ -1081,7 +1105,7 @@ async def generate_image(interaction: discord.Interaction, prompt: str):
             },
         )
 
-        result = handler.get()
+        result = await asyncio.to_thread(handler.get)
 
         for i, image_info in enumerate(result['images']):
             image_url = image_info['url']
@@ -1093,9 +1117,25 @@ async def generate_image(interaction: discord.Interaction, prompt: str):
                         continue
                     image_data = await resp.read()
 
+            # Open the image with PIL
+            image = Image.open(io.BytesIO(image_data))
+
+            # Create PngInfo object and add metadata
+            metadata = PngInfo()
+            metadata.add_text("Enhanced Prompt", enhanced_prompt)
+
+            # Save the image with metadata to a new bytes buffer
+            buffer = io.BytesIO()
+            image.save(buffer, format="PNG", pnginfo=metadata)
+            buffer.seek(0)
+
+            # Create Discord file object
+            file = discord.File(buffer, filename=f"generated_image_{i+1}.png")
+
+            # Send the image with a simple message
             await interaction.followup.send(
-                f"Generated image {i+1} for prompt: '{prompt}'",
-                file=discord.File(io.BytesIO(image_data), filename=f"generated_image_{i+1}.png")
+                content=f"Generated image {i+1} for prompt: '{prompt}'",
+                file=file
             )
 
         logger.info(f"Successfully generated and sent {config['num_images']} image(s) for user {interaction.user.name}")
@@ -1114,8 +1154,33 @@ def save_user_config(user_id, config):
 def load_user_config(user_id):
     if os.path.exists(f'user_configs/{user_id}.json'):
         with open(f'user_configs/{user_id}.json', 'r') as f:
-            return json.load(f)
-    return {}
+            config = json.load(f)
+            # Ensure the new option is present
+            if 'enhance_prompt' not in config:
+                config['enhance_prompt'] = DEFAULT_CONFIG['enhance_prompt']
+            return config
+    return DEFAULT_CONFIG.copy()
+
+async def enhance_prompt(prompt):
+    system_message = """You are an AI assistant specializing in enhancing image generation prompts. Your task is to take a user's brief prompt and expand it into a more detailed and vivid description. Focus on adding specific details about the scene, lighting, mood, and style. Keep the enhanced prompt concise and directly usable for image generation. Provide only the enhanced prompt without any introductory text or explanations."""
+
+    user_message = f"Please enhance the following image generation prompt: {prompt}"
+
+    try:
+        response = await async_anthropic_client.messages.create(
+            model="claude-3-5-sonnet-20240620",
+            max_tokens=150,
+            temperature=0.7,
+            system=system_message,
+            messages=[
+                {"role": "user", "content": user_message}
+            ]
+        )
+        enhanced_prompt = response.content[0].text.strip()
+        return enhanced_prompt
+    except Exception as e:
+        logger.error(f"Error enhancing prompt: {str(e)}", exc_info=True)
+        return prompt  # Return the original prompt if enhancement fails
             
 async def get_query_terms(message, chat_mode):
     config, _ = await get_channel_configuration(message)
