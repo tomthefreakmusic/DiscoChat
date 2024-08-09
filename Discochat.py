@@ -2,8 +2,7 @@ import json
 import random
 import re
 import traceback
-from typing import Literal
-import anthropic
+from typing import Any, Dict, List, Literal
 from anthropic import AsyncAnthropic
 import discord
 from discord import app_commands
@@ -315,9 +314,13 @@ async def retrieve_relevant_messages(message, query_terms, token_length, recent_
     logger.debug(f"Token length: {token_length}")
     logger.debug(f"Recent message IDs: {recent_message_ids}")
 
-    if not query_terms or recent_message_ids is None:
-        logger.warning("No query terms or recent message IDs provided")
+    if not query_terms:
+        logger.info("No specific query terms provided. Skipping relevant message retrieval.")
         return ""
+
+    if recent_message_ids is None:
+        logger.warning("No recent message IDs provided. Using an empty list.")
+        recent_message_ids = []
 
     channel = str(message.channel.id)
     distance_threshold = 0.85
@@ -1184,13 +1187,15 @@ async def enhance_prompt(prompt):
 async def get_query_terms(message, chat_mode):
     config, _ = await get_channel_configuration(message)
     
-    if chat_mode not in {"Memory", "Extended Memory"}:
-        return []
-
-    if chat_mode == "Extended Memory":
+    if chat_mode in {"Extended Memory", "Extended Memory Mistral"}:
         return await get_extended_memory_query_terms(message)
-    else:
+    elif chat_mode == "Memory":
         return await get_detailed_query_terms(message)
+    elif chat_mode == "Day Dream":
+        return await get_fast_query_terms(message)
+    else:
+        logger.warning(f"Unknown chat mode: {chat_mode}. Using fast query terms.")
+        return await get_fast_query_terms(message)
 
 async def get_fast_query_terms(message, num_terms=5):
     # Get recent messages
@@ -1268,25 +1273,30 @@ async def get_extended_memory_query_terms(message):
 
     user_content = f"{full_text}\n\n Based on the recent conversation, provide 5 key terms or phrases for querying a vector database."
 
-    response = await async_anthropic_client.messages.create(
-        model="claude-3-haiku-20240307",
-        max_tokens=100,
-        temperature=0.2,
-        system=system_content,
-        messages=[
-            {"role": "user", "content": user_content}
-        ]
-    )
+    try:
+        response = await async_anthropic_client.messages.create(
+            model="claude-3-haiku-20240307",
+            max_tokens=100,
+            temperature=0.2,
+            system=system_content,
+            messages=[
+                {"role": "user", "content": user_content}
+            ]
+        )
 
-    # Extract terms from the response
-    terms = [term.strip() for term in response.content[0].text.strip().split('\n') if term.strip()]
-    
-    # Ensure we have exactly 5 terms
-    terms = terms[:5]
-    while len(terms) < 5:
-        terms.append("")  # Add empty strings if we have fewer than 5 terms
+        # Extract terms from the response
+        terms = [term.strip() for term in response.content[0].text.strip().split('\n') if term.strip()]
+        
+        # Ensure we have exactly 5 terms
+        terms = terms[:5]
+        while len(terms) < 5:
+            terms.append("")  # Add empty strings if we have fewer than 5 terms
 
-    return terms
+        logger.debug(f"Extended memory query terms: {terms}")
+        return terms
+    except Exception as e:
+        logger.error(f"Error in get_extended_memory_query_terms: {e}", exc_info=True)
+        return []  # Return an empty list if there's an error
 
 async def generate_completion_messages(
     message,
@@ -1411,15 +1421,57 @@ async def respond_to_message(message):
             formatted_system_message,
             config["max_response_tokens"],
             config["temperature"],
+            chat_mode  # Add this line to pass the chat_mode
         )
         await send_long_discord_message(message, response)
 
+async def generate_mistral_response(system_message: str, messages: List[Dict[str, Any]], max_tokens: int, temperature: float) -> str:
+    try:
+        headers = {
+            "Authorization": f"Bearer {os.getenv('MISTRAL_API_KEY')}",
+            "Content-Type": "application/json"
+        }
+        
+        # Prepare the messages including the system message
+        api_messages = [{"role": "system", "content": system_message}] + messages
+        
+        payload = {
+            "model": "mistral-large-latest",
+            "messages": api_messages,
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+            "top_p": 1,  # Default value as per documentation
+            "stream": False,  # We don't want to stream the response
+            "safe_prompt": False,  # Default value
+        }
+
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                "https://api.mistral.ai/v1/chat/completions",
+                headers=headers,
+                json=payload
+            ) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    return data['choices'][0]['message']['content']
+                else:
+                    error_data = await resp.text()
+                    raise Exception(f"Mistral API error: Status {resp.status}, Response: {error_data}")
+
+    except aiohttp.ClientError as e:
+        logger.error(f"Network error in Mistral API call: {e}", exc_info=True)
+        raise
+    except Exception as e:
+        logger.error(f"Error in Mistral API call: {e}", exc_info=True)
+        raise
+
 async def get_response(
-    messages,
-    system_message,
-    max_response_tokens,
-    temperature,
-):
+    messages: List[Dict[str, Any]],
+    system_message: str,
+    max_response_tokens: int,
+    temperature: float,
+    chat_mode: str
+) -> str:
     # Create a unique filename based on the current timestamp
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     filename = f"response_input_{timestamp}.txt"
@@ -1446,21 +1498,40 @@ async def get_response(
         if messages and messages[0]['role'] == 'system':
             messages = messages[1:]
 
-        response = await async_anthropic_client.messages.create(
-            model=model,
-            max_tokens=max_response_tokens,
-            temperature=temperature,
-            system=system_message,
-            messages=messages
-        )
-        return response.content[0].text
+        if chat_mode == "Extended Memory Mistral":
+            try:
+                response = await generate_mistral_response(
+                    system_message,
+                    messages,
+                    max_response_tokens,
+                    temperature
+                )
+            except Exception as e:
+                logger.error(f"Error using Mistral API, falling back to Claude: {e}")
+                # Fallback to Claude if Mistral fails
+                response = await async_anthropic_client.messages.create(
+                    model="claude-3-5-sonnet-20240620",
+                    max_tokens=max_response_tokens,
+                    temperature=temperature,
+                    system=system_message,
+                    messages=messages
+                )
+                response = response.content[0].text
+        else:
+            # Use Claude API for other chat modes
+            response = await async_anthropic_client.messages.create(
+                model="claude-3-5-sonnet-20240620",
+                max_tokens=max_response_tokens,
+                temperature=temperature,
+                system=system_message,
+                messages=messages
+            )
+            response = response.content[0].text
 
-    except anthropic.APIError as e:
-        logger.error(f"Anthropic API error: {e}")
-        return "Sorry, there was an issue with the request. Please try again later."
+        return response
 
     except Exception as e:
-        logger.error(f"Non-API error occurred: {e}", exc_info=True)
+        logger.error(f"Error occurred during response generation: {e}", exc_info=True)
         return "Sorry, an unexpected error occurred. Please try again later."
 
 # Modify the error handling to use the logger
