@@ -32,8 +32,13 @@ import io
 from PIL import Image
 from PIL.PngImagePlugin import PngInfo
 from io import BytesIO
+import codecs
+import sys
 
 from chat_mode_presets import CHAT_MODE_PRESETS
+
+sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
+sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8')
 
 # Set up logger
 logger = logging.getLogger('discochat')
@@ -48,11 +53,11 @@ current_time = datetime.now().strftime("%Y%m%d_%H%M%S")
 log_filename = f'logs/discochat_{current_time}.log'
 
 # Create file handler which logs even debug messages
-file_handler = RotatingFileHandler(log_filename, maxBytes=5*1024*1024, backupCount=5)
+file_handler = RotatingFileHandler(log_filename, maxBytes=5*1024*1024, backupCount=5, encoding='utf-8')
 file_handler.setLevel(logging.DEBUG)
 
 # Create console handler with a higher log level
-console_handler = logging.StreamHandler()
+console_handler = logging.StreamHandler(codecs.getwriter('utf-8')(sys.stdout.buffer))
 console_handler.setLevel(logging.INFO)
 
 # Create formatter and add it to the handlers
@@ -137,10 +142,11 @@ max_discord_message_length = 2000
 class CustomClient(discord.Client):
     def __init__(self, *, intents: discord.Intents):
         super().__init__(intents=intents)
-        self.tree = discord.app_commands.CommandTree(self)
+        self.tree = app_commands.CommandTree(self)
 
     async def setup_hook(self):
         await self.tree.sync()
+
 
 intents = discord.Intents.default()
 intents.messages = True
@@ -153,6 +159,11 @@ client = CustomClient(intents=intents)
 r = Rake()
 
 user_configs = {}
+dm_channels = {}
+
+DEFAULT_AUTO_FOLLOW_UP = False
+last_bot_message = {}
+follow_up_tasks = {}
 
 # setup chroma and the collection (message_bank)
 chromadb_client = chromadb.Client(
@@ -226,7 +237,7 @@ def extract_message_data(message):
 
     return message_id, content, metadata
 
-def cleanup_database():
+async def cleanup_database():
     logger.info("Starting database cleanup process")
     all_messages = message_bank.get()
     low_quality_ids = []
@@ -241,12 +252,16 @@ def cleanup_database():
         
         if i % 1000 == 0:
             logger.info(f"Processed {i+1}/{total_messages} messages")
+            # Allow other tasks to run
+            await asyncio.sleep(0)
 
     if low_quality_ids:
         logger.info(f"Attempting to remove {len(low_quality_ids)} low-quality entries from the database")
         for id_to_delete in low_quality_ids:
             try:
                 message_bank.delete(ids=[id_to_delete])
+                # Allow other tasks to run
+                await asyncio.sleep(0)
             except KeyError:
                 failed_deletions.append(id_to_delete)
                 logger.warning(f"Failed to delete message with ID: {id_to_delete}")
@@ -414,7 +429,7 @@ async def retrieve_relevant_messages(message, query_terms, token_length, recent_
                 seen_messages.add(msg.id)
 
                 message_content = re.sub(r'\S{29,}', lambda m: m.group(0)[:28] + '...', msg.clean_content)
-                temp_string = f"[{str(msg.created_at)[:-16]}] {msg.author.name}: {message_content}, "
+                temp_string = f"[{str(msg.created_at)[:-16]}] {msg.author.name}: {message_content}"
                 
                 estimated_tokens = estimate_tokens(temp_string)
                 if token_length - estimated_tokens < 0:
@@ -426,7 +441,7 @@ async def retrieve_relevant_messages(message, query_terms, token_length, recent_
                 logger.debug(f"Added message {msg.id} to block, remaining tokens: {token_length}")
 
             if block_messages:
-                relevant_messages_result.append("".join(block_messages)[:-2])
+                relevant_messages_result.append("\n".join(block_messages))
                 quality_messages_count += 1
 
             if quality_messages_count >= 5:
@@ -435,11 +450,10 @@ async def retrieve_relevant_messages(message, query_terms, token_length, recent_
 
     except Exception as e:
         logger.error(f"Error processing query results: {e}", exc_info=True)
-        return ""
+        return []
 
-    result = "\n\n".join(relevant_messages_result)
-    logger.info(f"retrieve_relevant_messages completed, returned {len(result)} characters in {quality_messages_count} blocks")
-    return result
+    logger.info(f"retrieve_relevant_messages completed, returned {len(relevant_messages_result)} blocks")
+    return relevant_messages_result
 
 def get_relative_time(timestamp_str, current_time):
     timestamp = datetime.strptime(timestamp_str, "%Y-%m-%d %H:%M")
@@ -534,7 +548,7 @@ async def retrieve_sporadic_messages(message, token_length):
     sporadic_messages_result = sporadic_messages_result[:-2]
     return sporadic_messages_result
 
-async def summarize_extended_context(all_recent_messages, relevant_messages, summary_model, summary_max_tokens, full_recent_messages_count):
+async def summarize_extended_context(all_recent_messages, relevant_message_blocks, summary_model, summary_max_tokens, full_recent_messages_count):
     current_time = datetime.now()
     logger.info(f"Starting extended context summarization. Current time: {current_time}")
 
@@ -575,30 +589,27 @@ async def summarize_extended_context(all_recent_messages, relevant_messages, sum
     recent_messages_full = all_recent_messages[-full_recent_messages_count:]
     older_recent_messages = all_recent_messages[:-full_recent_messages_count]
     
-    # Split relevant messages into blocks
-    relevant_blocks = [block.strip() for block in relevant_messages.split('],') if block.strip()]
-    
     # Log the number of relevant blocks
-    logger.info(f"Number of relevant blocks: {len(relevant_blocks)}")
+    logger.info(f"Number of relevant blocks: {len(relevant_message_blocks)}")
     
     # Calculate token allocations
     older_recent_tokens = summary_max_tokens // 2
-    if relevant_blocks:
-        relevant_tokens_per_block = (summary_max_tokens - older_recent_tokens) // len(relevant_blocks)
+    if relevant_message_blocks:
+        relevant_tokens_per_block = (summary_max_tokens - older_recent_tokens) // len(relevant_message_blocks)
     else:
         relevant_tokens_per_block = 0
 
     # Create tasks for parallel summarization
     tasks = [
         summarize_block("".join(older_recent_messages), "older recent", older_recent_tokens),
-        *[summarize_block(block + ']', "semantically relevant", relevant_tokens_per_block) for block in relevant_blocks]
+        *[summarize_block(block, "semantically relevant", relevant_tokens_per_block) for block in relevant_message_blocks]
     ]
 
     # Log the summary input
     with open(file_path, "w", encoding="utf-8") as f:
         f.write(f"Summary input for {current_time}\n\n")
         f.write(f"Older recent messages:\n{''.join(older_recent_messages)}\n\n")
-        for i, block in enumerate(relevant_blocks):
+        for i, block in enumerate(relevant_message_blocks):
             f.write(f"Relevant block {i+1}:\n{block}\n\n")
 
     logger.info(f"Saved summary input to {file_path}")
@@ -642,14 +653,6 @@ def post_process_summary(summary):
     processed_lines = [line for line in lines if not line.strip().startswith(('I ', 'You ', 'We ', 'Please ', 'Let me '))]
     return '\n'.join(processed_lines)
 
-# Defines a helper function that retrieves the strings from "previous_relevant_messages" for the channel and returns the string.
-def retrieve_previously_relevant_messages(message):
-    channel = message.channel.id
-    if channel in previously_relevant_messages:
-        result_string = previously_relevant_messages[channel]
-        return result_string
-    else:
-        return ""
 
 # Defines a helper function that checks if the message is a DM.
 def is_dm(message):
@@ -780,24 +783,120 @@ async def handle_command(message):
         else:
             await message.channel.send("Command not found")
 
+
+async def update_auto_follow_up(channel, enabled):
+    config_path = f"./config/{channel.id}.json"
+    if os.path.isfile(config_path):
+        with open(config_path, "r") as f:
+            channel_config = json.load(f)
+    else:
+        channel_config = {"chat_mode": "Default"}
+
+    channel_config["auto_follow_up"] = enabled
+
+    with open(config_path, "w") as f:
+        json.dump(channel_config, f)
+
+    return enabled
+
+@client.tree.command()
+@app_commands.describe(enabled="Enable or disable auto follow-up")
+async def toggle_auto_follow_up(interaction: discord.Interaction, enabled: bool):
+    """Toggle the auto follow-up feature for this channel"""
+    if not check_permissions(interaction):
+        await interaction.response.send_message("You don't have permission to use this command.", ephemeral=True)
+        return
+
+    new_state = await update_auto_follow_up(interaction.channel, enabled)
+    await interaction.response.send_message(f"Auto follow-up has been {'enabled' if new_state else 'disabled'} for this channel.")
+
+# Add this new function to handle the auto-follow-up
+async def schedule_auto_follow_up(channel_id, delay):
+    await asyncio.sleep(delay)
+    
+    channel = client.get_channel(channel_id)
+    if channel is None:
+        channel = dm_channels.get(channel_id)
+    
+    if channel is None:
+        logger.warning(f"Channel {channel_id} not found for auto-follow-up")
+        return
+
+    last_message = last_bot_message.get(channel_id)
+    if not last_message:
+        logger.warning(f"No last message found for channel {channel_id}")
+        return
+
+    # Check the last 5 messages in the channel
+    async for message in channel.history(limit=5):
+        if message.author != client.user:
+            logger.info(f"Auto-follow-up cancelled for channel {channel_id}: A user has responded")
+            return
+        if message.id != last_message['message'].id:
+            logger.info(f"Auto-follow-up cancelled for channel {channel_id}: Bot has already sent a follow-up")
+            return
+
+    logger.info(f"Generating auto-follow-up message for channel {channel_id}")
+
+    # Generate and send the follow-up message
+    original_message = last_message['message']
+    original_response = last_message['response']
+    time_passed = datetime.now() - last_message['timestamp']
+
+    config, chat_mode, auto_follow_up = await get_channel_configuration(original_message)
+    
+    # Reuse the context from the previous response
+    completion_messages, _, _, formatted_system_message = await generate_completion_messages(
+        original_message,
+        config["system_message"],
+        await get_query_terms(original_message, chat_mode),
+        config["recent_messages_length"],
+        config["relevant_messages_length"],
+        config["sporadic_messages_length"],
+        chat_mode,
+    )
+
+    # Reformat messages to avoid the "system" role issue
+    formatted_messages = [msg for msg in completion_messages if msg['role'] != 'system']
+    formatted_messages.extend([
+        {"role": "assistant", "content": original_response},
+        {"role": "user", "content": f"It has been approximately {time_passed.total_seconds() // 60} minutes since the user last responded. Please provide a single follow-up message to continue the conversation."}
+    ])
+
+    follow_up_response = await get_response(
+        formatted_messages,
+        formatted_system_message,
+        config["max_response_tokens"],
+        config["temperature"],
+        chat_mode
+    )
+
+    await send_long_discord_message(channel, follow_up_response)
+
+    logger.info(f"Sent auto-follow-up message in channel {channel_id}")
+
+
 async def get_channel_configuration(message):
+    channel_id = message.channel.id
     try:
-        if os.path.isfile(f"./config/{message.channel.id}.json"):
-            with open(f"./config/{message.channel.id}.json", "r") as f:
+        if os.path.isfile(f"./config/{channel_id}.json"):
+            with open(f"./config/{channel_id}.json", "r") as f:
                 channel_config = json.load(f)
             chat_mode = channel_config.get("chat_mode", "Default")
+            auto_follow_up = channel_config.get("auto_follow_up", DEFAULT_AUTO_FOLLOW_UP)
         else:
             chat_mode = "Default"
+            auto_follow_up = DEFAULT_AUTO_FOLLOW_UP
 
         config = CHAT_MODE_PRESETS[chat_mode]
-        return config, chat_mode
+        return config, chat_mode, auto_follow_up
 
     except (IOError, ValueError, KeyError) as e:
-        print(f"Error handling channel configuration: {e}")
+        logger.error(f"Error handling channel configuration for channel {channel_id}: {e}")
         os.makedirs("./config/", exist_ok=True)
-        with open(f"./config/{message.channel.id}.json", "w") as f:
-            json.dump({"chat_mode": "Default"}, f)
-        return CHAT_MODE_PRESETS["Default"], "Default"
+        with open(f"./config/{channel_id}.json", "w") as f:
+            json.dump({"chat_mode": "Default", "auto_follow_up": DEFAULT_AUTO_FOLLOW_UP}, f)
+        return CHAT_MODE_PRESETS["Default"], "Default", DEFAULT_AUTO_FOLLOW_UP
 
 async def update_channel_configuration(message, new_chat_mode):
     if new_chat_mode not in CHAT_MODE_PRESETS:
@@ -1186,7 +1285,7 @@ async def enhance_prompt(prompt):
         return prompt  # Return the original prompt if enhancement fails
             
 async def get_query_terms(message, chat_mode):
-    config, _ = await get_channel_configuration(message)
+    config, _, auto_follow_up = await get_channel_configuration(message)
     
     if chat_mode in {"Extended Memory", "Extended Memory Mistral"}:
         return await get_extended_memory_query_terms(message)
@@ -1308,7 +1407,7 @@ async def generate_completion_messages(
     sporadic_messages_length,
     chat_mode,
 ):
-    config, _ = await get_channel_configuration(message)
+    config, _, auto_follow_up = await get_channel_configuration(message)
 
     # Retrieve recent messages
     all_recent_messages, recent_message_ids = await retrieve_recent_messages(
@@ -1316,7 +1415,7 @@ async def generate_completion_messages(
     )
     
     # Retrieve semantically relevant messages
-    relevant_messages = await retrieve_relevant_messages(
+    relevant_message_blocks = await retrieve_relevant_messages(
         message, query_terms, relevant_messages_length, recent_message_ids
     )
 
@@ -1332,7 +1431,7 @@ async def generate_completion_messages(
     if chat_mode == "Extended Memory":
         summary, recent_messages_full = await summarize_extended_context(
             all_recent_messages,
-            relevant_messages,
+            relevant_message_blocks,
             config["summary_model"],
             config["summary_max_tokens"],
             full_recent_messages_count
@@ -1350,7 +1449,9 @@ async def generate_completion_messages(
     context_message += "Recent messages:\n" + "".join(recent_messages_full)
 
     if chat_mode == "Memory":
-        context_message += f"\n\nRelevant past messages:\n{relevant_messages}"
+        # Join the relevant message blocks into a single string for the Memory mode
+        relevant_messages_str = "\n\n".join(relevant_message_blocks)
+        context_message += f"\n\nRelevant past messages:\n{relevant_messages_str}"
     elif chat_mode == "Day Dream":
         context_message += f"\n\n<sporadic messages>\n{sporadic_messages}\n</sporadic messages>"
 
@@ -1359,13 +1460,12 @@ async def generate_completion_messages(
 
     # Construct the message array
     messages = [
-        {"role": "system", "content": formatted_system_message},
         {"role": "user", "content": context_message},
         {"role": "assistant", "content": "Thank you for providing the context. I'll keep that in mind for our conversation."},
         {"role": "user", "content": message.clean_content}
     ]
 
-    return messages, recent_messages_full, relevant_messages, formatted_system_message
+    return messages, recent_messages_full, relevant_message_blocks, formatted_system_message
 
 # Helper function to format messages (if needed)
 def format_messages(messages):
@@ -1404,11 +1504,11 @@ async def should_respond(message):
 # defines a helper function for handling responses.
 async def respond_to_message(message):
     async with message.channel.typing():
-        config, chat_mode = await get_channel_configuration(message)
+        config, chat_mode, auto_follow_up = await get_channel_configuration(message)
         
         query_terms = await get_query_terms(message, chat_mode)
 
-        completion_messages, _, _, formatted_system_message = await generate_completion_messages(
+        completion_messages, recent_messages_full, relevant_messages, formatted_system_message = await generate_completion_messages(
             message,
             config["system_message"],
             query_terms,
@@ -1422,9 +1522,30 @@ async def respond_to_message(message):
             formatted_system_message,
             config["max_response_tokens"],
             config["temperature"],
-            chat_mode  # Add this line to pass the chat_mode
+            chat_mode
         )
-        await send_long_discord_message(message, response)
+        await send_long_discord_message(message.channel, response)
+        
+        # Set up auto-follow-up timer if enabled
+        if auto_follow_up:
+            channel_id = message.channel.id
+            last_bot_message[channel_id] = {
+                'message': message,
+                'response': response,
+                'timestamp': datetime.now()
+            }
+            
+            # Cancel any existing follow-up task for this channel
+            if channel_id in follow_up_tasks:
+                follow_up_tasks[channel_id].cancel()
+            
+            # Schedule a new follow-up task with the original delay
+            delay = random.randint(5 * 60, 6 * 60 * 60)  # Random delay between 5 minutes and 6 hours
+            follow_up_tasks[channel_id] = asyncio.create_task(schedule_auto_follow_up(channel_id, delay))
+            
+            logger.info(f"Scheduled auto-follow-up for channel {channel_id} in {delay} seconds")
+        
+        return response
 
 async def generate_mistral_response(system_message: str, messages: List[Dict[str, Any]], max_tokens: int, temperature: float) -> str:
     try:
@@ -1495,15 +1616,14 @@ async def get_response(
     logger.info(f"Saved response input to {file_path}")
 
     try:
-        # Remove the system message from the messages list if it's there
-        if messages and messages[0]['role'] == 'system':
-            messages = messages[1:]
+        # Remove any system messages from the input
+        filtered_messages = [msg for msg in messages if msg['role'] != 'system']
 
         if chat_mode == "Extended Memory Mistral":
             try:
                 response = await generate_mistral_response(
                     system_message,
-                    messages,
+                    filtered_messages,
                     max_response_tokens,
                     temperature
                 )
@@ -1515,7 +1635,7 @@ async def get_response(
                     max_tokens=max_response_tokens,
                     temperature=temperature,
                     system=system_message,
-                    messages=messages
+                    messages=filtered_messages
                 )
                 response = response.content[0].text
         else:
@@ -1525,39 +1645,46 @@ async def get_response(
                 max_tokens=max_response_tokens,
                 temperature=temperature,
                 system=system_message,
-                messages=messages
+                messages=filtered_messages
             )
             response = response.content[0].text
 
         return response
 
     except Exception as e:
-        logger.error(f"Error occurred during response generation: {e}", exc_info=True)
-        return "Sorry, an unexpected error occurred. Please try again later."
+        error_message = f"An error occurred while generating a response: {str(e)}"
+        logger.error(error_message)
+        return error_message
 
 # Modify the error handling to use the logger
 def handle_exception(e):
     logger.error(f"Error occurred: {e}", exc_info=True)
 
 # defines a helper function that handles messages bigger than discord handles by default (nitro makes this redundant)
-async def send_long_discord_message(message, response):
+async def send_long_discord_message(channel, response):
+    try:
+        # Replace escaped newlines with actual newlines
+        response = response.replace('\\n', '\n')
 
-    # Replace escaped newlines with actual newlines
-    response = response.replace('\\n', '\n')
+        if len(response) <= max_discord_message_length:
+            await channel.send(response)
+        else:
+            parts = textwrap.wrap(
+                response,
+                max_discord_message_length,
+                break_long_words=False,
+                replace_whitespace=False,
+            )
 
-    if len(response) <= max_discord_message_length:
-        await message.channel.send(response)
-    else:
-        parts = textwrap.wrap(
-            response,
-            max_discord_message_length,
-            break_long_words=False,
-            replace_whitespace=False,
-        )
-
-        for part in parts:
-            await message.channel.send(part)
-            await asyncio.sleep(1)
+            for part in parts:
+                await channel.send(part)
+                await asyncio.sleep(1)
+        
+        logger.info(f"Sent message in channel {channel.id}")
+    except discord.errors.Forbidden:
+        logger.error(f"Forbidden to send message in channel {channel.id}")
+    except Exception as e:
+        logger.error(f"Error sending message in channel {channel.id}: {str(e)}")
 
 # defines a function that prints a message to the console when the discord bot is ready
 @client.event
@@ -1565,35 +1692,51 @@ async def on_ready():
     logger.info(f"{client.user} has connected to Discord!")
     logger.info(f"Connected servers: {', '.join([guild.name for guild in client.guilds])}")
     
-    # Sync the command tree
-    try:
-        synced = await client.tree.sync()
-        logger.info(f"Synced {len(synced)} command(s)")
-    except Exception as e:
-        logger.error(f"Failed to sync command tree: {e}", exc_info=True)
+    # Log the synced commands
+    synced_commands = await client.tree.sync()
+    logger.info(f"Synced {len(synced_commands)} command(s): {', '.join([cmd.name for cmd in synced_commands])}")
 
 # Add the event handlers to the client
 @client.event
 async def on_message(message):
-    if check_permissions(message):
-        store_message(message)
-        try:
-            if await is_command(message):
-                await handle_command(message)
-            elif await should_respond(message):
-                await respond_to_message(message)
-        except Exception as e:
-            handle_exception(e)
+    if isinstance(message.channel, discord.DMChannel):
+        dm_channels[message.channel.id] = message.channel
+
+    if message.author != client.user:
+        # Cancel any existing follow-up task for this channel
+        channel_id = message.channel.id
+        if channel_id in follow_up_tasks:
+            follow_up_tasks[channel_id].cancel()
+        
+        # Process the message as before
+        if check_permissions(message):
+            store_message(message)
+            try:
+                if await is_command(message):
+                    await handle_command(message)
+                elif await should_respond(message):
+                    await respond_to_message(message)
+            except Exception as e:
+                handle_exception(e)
+    else:
+        # If it's a bot message, don't process it further
+        return
 
 # Run the bot
-try:
-    cleanup_database()
-    if TOKEN is not None:
-        client.run(TOKEN)
-    else:
-        raise ValueError("TOKEN is not set.")
-except ValueError as e:
-    logger.critical(str(e))
+async def main():
+    try:
+        await cleanup_database()
+        if TOKEN is not None:
+            await client.start(TOKEN)
+        else:
+            raise ValueError("TOKEN is not set.")
+    except ValueError as e:
+        logger.critical(str(e))
+    finally:
+        # Clean up any running tasks
+        for task in follow_up_tasks.values():
+            task.cancel()
+        await client.close()
 
 # defines a function that saves the chroma database to disk.
 def save_database():
@@ -1602,3 +1745,6 @@ def save_database():
 
 # saves the database on exit (workaround for https://github.com/chroma-core/chroma/issues/622)
 atexit.register(save_database)
+
+if __name__ == "__main__":
+    asyncio.run(main())
