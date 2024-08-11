@@ -919,6 +919,7 @@ class ModelSelect(discord.ui.Select):
             discord.SelectOption(label="Flux Pro", value="fal-ai/flux-pro"),
             discord.SelectOption(label="Flux Schnell", value="fal-ai/flux/schnell"),
             discord.SelectOption(label="Flux Dev", value="fal-ai/flux/dev"),
+            discord.SelectOption(label="Flux Realism", value="fal-ai/flux-realism")
         ]
         super().__init__(placeholder="Select model", options=options)
         self.default = default
