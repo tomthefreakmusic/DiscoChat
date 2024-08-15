@@ -23,12 +23,9 @@ from collections import Counter
 import logging
 from logging.handlers import RotatingFileHandler
 from datetime import datetime, timedelta
-from collections import Counter
 import fal_client
 import io
 import aiohttp
-import asyncio
-import io
 from PIL import Image
 from PIL.PngImagePlugin import PngInfo
 from io import BytesIO
@@ -563,7 +560,15 @@ async def summarize_extended_context(all_recent_messages, relevant_message_block
         system_content = f"""You are assisting the chatbot "{bot_name}" by summarizing a block of {block_type} messages.
         Create a concise summary of the provided content without adding new information or interpretations.
         Focus on key points, topics, and information present in the given text.
-        Do not use lists or bullet points to structure your summary."""
+        
+        Summary format example:
+        
+        last tuesday alice and bob discussed cats.
+        alice said she liked indoor cats, in particular short haired ones. 
+        bob responded to alice by saying he likes cats as well and that he has a dark grey cat.
+        alice revealed that her cat is a three year old tabby.
+        
+        """
 
         user_content = f"""Summarize this block of {block_type} messages:
 
@@ -582,6 +587,8 @@ async def summarize_extended_context(all_recent_messages, relevant_message_block
             system=system_content,
             messages=[{"role": "user", "content": user_content}]
         )
+
+        logger.info(f"Token usage for summarize_block ({block_type}): Input tokens: {response.usage.input_tokens}, Output tokens: {response.usage.output_tokens}")
 
         return response.content[0].text
 
@@ -1366,23 +1373,25 @@ async def get_extended_memory_query_terms(message):
 
     system_content = """You are an AI assistant that extracts key terms for querying a vector database. 
     Your task is to analyze the recent conversation and output exactly 5 key terms or phrases, each on a new line. 
-    Only include terms that are directly relevant to the main topics of the conversation.
-    These terms should be concise, diverse, and directly usable for database queries.
+    Only include phrases that are directly relevant to the most recent topics of the conversation.
+    These phrases should be concise, diverse, and directly usable for database queries.
     Prioritize noun phrases and specific concepts over general words.
     Do not include any explanations or additional text."""
 
-    user_content = f"{full_text}\n\n Based on the recent conversation, provide 5 key terms or phrases for querying a vector database."
+    user_content = f"{full_text}\n\n Based on the recent conversation, provide 5 key terms or phrases from throughout the text for querying a vector database."
 
     try:
         response = await async_anthropic_client.messages.create(
             model="claude-3-haiku-20240307",
             max_tokens=100,
-            temperature=0.2,
+            temperature=0.4,
             system=system_content,
             messages=[
                 {"role": "user", "content": user_content}
             ]
         )
+
+        
 
         # Extract terms from the response
         terms = [term.strip() for term in response.content[0].text.strip().split('\n') if term.strip()]
@@ -1420,7 +1429,7 @@ async def generate_completion_messages(
     )
 
     # Define the number of full recent messages to include
-    full_recent_messages_count = 25  # Adjust this value as needed
+    full_recent_messages_count = 50  # Adjust this value as needed
 
     # Retrieve sporadic messages if in Day Dream mode
     sporadic_messages = ""
@@ -1461,7 +1470,7 @@ async def generate_completion_messages(
     # Construct the message array
     messages = [
         {"role": "user", "content": context_message},
-        {"role": "assistant", "content": "Thank you for providing the context. I'll keep that in mind for our conversation."},
+        {"role": "assistant", "content": "Thank you for providing the context. I understand that this is an incomplete picture of our whole conversation, but I will do my best to respond to your message with regards to the information provided. When I respond, I will follow both my primary and tertiary objectives."},
         {"role": "user", "content": message.clean_content}
     ]
 
@@ -1637,6 +1646,7 @@ async def get_response(
                     system=system_message,
                     messages=filtered_messages
                 )
+                logger.info(f"Token usage for get_response (Claude fallback): Input tokens: {response.usage.input_tokens}, Output tokens: {response.usage.output_tokens}")
                 response = response.content[0].text
         else:
             # Use Claude API for other chat modes
@@ -1647,6 +1657,7 @@ async def get_response(
                 system=system_message,
                 messages=filtered_messages
             )
+            logger.info(f"Token usage for get_response (Claude): Input tokens: {response.usage.input_tokens}, Output tokens: {response.usage.output_tokens}")
             response = response.content[0].text
 
         return response

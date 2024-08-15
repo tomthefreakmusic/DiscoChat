@@ -42,8 +42,8 @@ Feel free to make creative connections between the current conversation and the 
     },
     "Extended Memory": {
         "recent_messages_length": 5000,
-        "summary_recent_messages_length": 10000,
-        "relevant_messages_length": 10000,
+        "summary_recent_messages_length": 20000,
+        "relevant_messages_length": 5000,
         "sporadic_messages_length": 0,
         "max_response_tokens": 600,
         "system_message": """You are a conversational system named {bot_name} with advanced message retrieval. You're engaging in a conversation on Discord. 
