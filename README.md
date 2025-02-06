@@ -1,39 +1,68 @@
-# DiscoChat 
-## An GPT-3.5-Turbo based Discord Bot with Vector Database message handling.
+# DiscoChat
 
-### Introduction
-DiscoChat is a Discord bot that leverages OpenAI's API to interact with users, and integrates a vector database, ChromaDB, to maintain and retrieve relevant historical context for enhanced chat completions. It fetches recent and relevant messages from Discord and the ChromaDB respectively, and uses them to generate context-aware responses.
+A Discord bot powered by Claude 3.5 Sonnet with advanced memory and conversation capabilities.
 
-The bot can be interacted with by mentioning it. In Direct Messages (DMs), the bot responds to all messages.
+## Features
 
-### Features
+- Multiple chat modes including Extended Memory, Memory, and Day Dream
+- Image generation capabilities
+- Semantic message search and retrieval
+- Auto follow-up conversations
+- Server whitelist and permission management
 
-- Uses the GPT-3.5-Turbo model for chat completions, this can easily be reconfigured for GPT 4 if you have API access.
-- Uses ChromaDB for vector database message storage and retrival.
-- Treats all channels and direct messages as seperate histories. Messages from one channel can not access messages from others, although this can be configured with minimal alterations.
-- Can handle long responses that exceed Discord's max message length.
-- Extracts and stores metadata (such as server, channel, author, timestamp, keywords, etc.) along with messages for relevance-based message retrieval.
+## Setup
 
-### Setup
+1. Clone the repository
+2. Install dependencies:
+```bash
+pip install -r requirements.txt
+```
+3. Create a `.env` file with the following required variables:
+```env
+DISCORD_TOKEN=your_discord_bot_token
+ANTHROPIC_API_KEY=your_anthropic_api_key
+BOT_NAME=your_bot_name
+DATABASE_DIRECTORY=path_to_database_directory
+DEV_NAME=developer_name
+SERVER_WHITELIST=comma_separated_server_list
+FAL_KEY=your_fal_api_key
+```
 
-Install the required Python packages: 
+Optional environment variables:
+```env
+MISTRAL_API_KEY=your_mistral_api_key  # Required for Extended Memory Mistral mode
+BFL_API_KEY=your_bfl_api_key  # Required for image generation
+```
 
-    openai, discord.py, chromadb, dotenv, rake-nltk, tiktoken, asyncio, atexit, nltk
+4. Download required NLTK data:
+```python
+import nltk
+nltk.download("stopwords")
+nltk.download("punkt")
+```
 
-Setup a discord bot via https://discord.com/developers/applications. The bot must have permissions to: read messages/view channels, send messages and read message history.
+## Running the Bot
 
-Setup a .env file in your project root with your Discord bot token and OpenAI API key:
+```bash
+python Discochat.py
+```
 
-    DISCORD_TOKEN=your_discord_token
-    OPENAI_API_KEY=your_openai_key
-    BOT_NAME=your_bot_name
-    DATABASE_DIRECTORY=where_you_want_the_database_stored
+## Available Commands
 
-Then run the script using Python 3.8 or later.
+- `!botname populate database` - Populate the message database
+- `!botname clear database` - Clear the message database
+- `!botname count database` - Show database message count
+- `!botname set chat mode` - Change the chat mode
+- `!botname show configuration` - Display current configuration
 
-    python main.py
+## Chat Modes
 
-### Commands
+- **Extended Memory** - Uses Claude to summarize conversation history
+- **Memory** - Uses semantic search to find relevant past messages
+- **Day Dream** - Includes random past messages for creative responses
+- **Extended Memory Mistral** - Uses Mistral model for memory processing
 
-    !botname populate database: Populates the database with historical messages from the Discord server.
+## Permissions
+
+The bot can be restricted to specific servers and users with the bot's role.
 

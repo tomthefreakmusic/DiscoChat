@@ -1,0 +1,45 @@
+# Core dependencies
+aiohttp
+anthropic
+discord.py
+python-dotenv
+
+# Database and storage
+chromadb
+chroma-hnswlib
+
+# NLP and text processing
+nltk
+rake-nltk
+
+# Image processing
+Pillow
+
+# API Clients
+mistralai  # For Mistral model support
+
+# Async and HTTP
+asyncio
+httpx
+aiosignal
+anyio
+
+# Data handling and validation
+pydantic
+pydantic-core
+numpy
+
+# Monitoring and telemetry
+opentelemetry-api
+opentelemetry-sdk
+opentelemetry-instrumentation-fastapi
+opentelemetry-exporter-otlp-proto-grpc
+
+# Web framework
+fastapi
+uvicorn
+
+# Utilities
+tqdm  # Progress bars
+PyYAML  # YAML parsing
+orjson  # Fast JSON parsing

@@ -1,37 +1,42 @@
+# Standard library imports
+import atexit
+import asyncio
+import codecs
+import io
+from io import BytesIO
 import json
+import logging
+from logging.handlers import RotatingFileHandler
+import os
 import random
 import re
+import sys
+import time
+import textwrap
 import traceback
+from collections import Counter
+from datetime import datetime, timedelta
 from typing import Any, Dict, List, Literal
+
+# Third-party imports
+import aiohttp
 from anthropic import AsyncAnthropic
-import discord
-from discord import app_commands
-from discord.ui import View, Button
-import os
-import asyncio
 import chromadb
 from chromadb.config import Settings
 from chromadb.errors import IDAlreadyExistsError
+from chromadb.utils import embedding_functions
+import discord
+from discord import app_commands
+from discord.ui import View, Button
 from dotenv import load_dotenv
-from rake_nltk import Rake
 import nltk
-import textwrap
-import atexit
 from nltk.tokenize import word_tokenize
 from nltk.corpus import stopwords
-from collections import Counter
-import logging
-from logging.handlers import RotatingFileHandler
-from datetime import datetime, timedelta
-import fal_client
-import io
-import aiohttp
 from PIL import Image
 from PIL.PngImagePlugin import PngInfo
-from io import BytesIO
-import codecs
-import sys
+from rake_nltk import Rake
 
+# Local imports
 from chat_mode_presets import CHAT_MODE_PRESETS
 
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
@@ -96,6 +101,8 @@ TOKEN = os.getenv("DISCORD_TOKEN")
 
 FAL_KEY = os.getenv("FAL_KEY")
 
+BFL_API_KEY = os.getenv("BFL_API_KEY")
+
 # Set Anthropic API key
 async_anthropic_client = AsyncAnthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
 
@@ -118,9 +125,13 @@ else:
 
 # sets the database directory.
 if os.getenv("DATABASE_DIRECTORY") is None:
-    database_directory = "/database/"
+    database_directory = "./database/"
 else:
     database_directory = os.getenv("DATABASE_DIRECTORY")
+    # Normalize the path for Windows and convert to absolute path if needed
+    database_directory = os.path.abspath(os.path.normpath(database_directory))
+    # Ensure the database directory exists
+    os.makedirs(database_directory, exist_ok=True)
 
 # sets the model.
 model = "claude-3-5-sonnet-20240620"
@@ -153,7 +164,16 @@ intents.message_content = True
 client = CustomClient(intents=intents)
 
 # Initialize Rake
+logger.info("Initializing RAKE...")
 r = Rake()
+logger.info("RAKE initialized successfully")
+
+nltk.download('punkt_tab')
+
+sample_text = "The quick brown fox jumps over the lazy dog"
+r.extract_keywords_from_text(sample_text)
+keywords = r.get_ranked_phrases()
+logger.info(f"Extracted keywords: {keywords}")
 
 user_configs = {}
 dm_channels = {}
@@ -163,31 +183,50 @@ last_bot_message = {}
 follow_up_tasks = {}
 
 # setup chroma and the collection (message_bank)
-chromadb_client = chromadb.Client(
-    Settings(chroma_db_impl="duckdb+parquet", persist_directory=f"{database_directory}")
-)
-
-message_bank = chromadb_client.get_or_create_collection(
-    "message_bank", metadata={"hnsw:space": "cosine"}
-)
+try:
+    logger.info(f"Initializing ChromaDB with database directory: {database_directory}")
+    
+    # Initialize ChromaDB with the new format
+    chromadb_client = chromadb.PersistentClient(path=database_directory)
+    
+    # Create the embedding function using SentenceTransformer
+    embedding_function = embedding_functions.SentenceTransformerEmbeddingFunction(
+        model_name="all-MiniLM-L6-v2"
+    )
+    
+    # Try to get existing collection or create new one with proper settings
+    message_bank = chromadb_client.get_or_create_collection(
+        name="message_bank",
+        metadata={"hnsw:space": "cosine"},
+        embedding_function=embedding_function
+    )
+    logger.info(f"Successfully initialized ChromaDB collection 'message_bank'")
+except Exception as e:
+    logger.error(f"Error initializing ChromaDB: {str(e)}")
+    raise
 
 # Defines the store_message function, for storing the discord messages in the chroma database.
 def store_message(message):
     if message and message.content:
-        message_id, content, metadata = extract_message_data(message)
-
         try:
+            message_id, content, metadata = extract_message_data(message)
+            logger.info(f"Attempting to store message {message_id} in database")
+            logger.debug(f"Message content: {content[:100]}...")  # Log first 100 chars
+            logger.debug(f"Message metadata: {metadata}")
+
             message_bank.add(
                 documents=[content],
                 metadatas=[metadata],
                 ids=[message_id],
             )
+            logger.info(f"Successfully stored message {message_id}")
         except IDAlreadyExistsError:
             # If the document with the same id already exists in the database, skip it
+            logger.debug(f"Message {message_id} already exists in database, skipping")
             pass
         except Exception as e:
             # Handle other types of exceptions
-            print(f"Error adding message to database: {e}")
+            logger.error(f"Error adding message {message_id} to database: {str(e)}")
             traceback.print_exc()
 
 # This function extracts the relevant data from a discord message and returns it in a format that can be stored in the database.
@@ -343,7 +382,7 @@ async def retrieve_relevant_messages(message, query_terms, token_length, recent_
     try:
         relevant_messages = message_bank.query(
             query_texts=query_terms,
-            n_results=10,
+            n_results=20,  # Increased from 10 to 20 to get more results
             where=where_conditions,
         )
         logger.debug(f"Raw query results: {relevant_messages}")
@@ -441,8 +480,8 @@ async def retrieve_relevant_messages(message, query_terms, token_length, recent_
                 relevant_messages_result.append("\n".join(block_messages))
                 quality_messages_count += 1
 
-            if quality_messages_count >= 5:
-                logger.debug(f"Reached 5 quality message blocks, stopping retrieval")
+            if quality_messages_count >= 10:  # Changed from 5 to 10
+                logger.debug(f"Reached 10 quality message blocks, stopping retrieval")
                 break
 
     except Exception as e:
@@ -712,12 +751,15 @@ def count_channel_database(message):
     # Query the database for all documents where the channel matches the current channel.
     # As we are not interested in the documents themselves, we only retrieve the metadata.
     channel_id = str(message.channel.id)
-    channel_messages = message_bank.get(where={"channel": channel_id})
-
-    # Count the number of messages
-    num_messages = len(channel_messages["ids"])
-
-    return num_messages
+    logger.info(f"Counting messages for channel {channel_id}")
+    try:
+        channel_messages = message_bank.get(where={"channel": channel_id})
+        num_messages = len(channel_messages["ids"])
+        logger.info(f"Found {num_messages} messages in channel {channel_id}")
+        return num_messages
+    except Exception as e:
+        logger.error(f"Error counting messages in channel {channel_id}: {str(e)}")
+        return 0
 
 def check_permissions(obj):
     try:
@@ -834,14 +876,29 @@ async def schedule_auto_follow_up(channel_id, delay):
         logger.warning(f"No last message found for channel {channel_id}")
         return
 
-    # Check the last 5 messages in the channel
-    async for message in channel.history(limit=5):
+    # Check the last 10 messages in the channel
+    bot_messages = []
+    user_responded = False
+    async for message in channel.history(limit=10):
         if message.author != client.user:
-            logger.info(f"Auto-follow-up cancelled for channel {channel_id}: A user has responded")
-            return
-        if message.id != last_message['message'].id:
-            logger.info(f"Auto-follow-up cancelled for channel {channel_id}: Bot has already sent a follow-up")
-            return
+            user_responded = True
+            break
+        if message.author == client.user:
+            bot_messages.append(message)
+        if message.id == last_message['message'].id:
+            break
+
+    if user_responded:
+        logger.info(f"Auto-follow-up cancelled for channel {channel_id}: A user has responded")
+        return
+
+    if not bot_messages:
+        logger.info(f"Auto-follow-up cancelled for channel {channel_id}: No recent bot messages found")
+        return
+
+    if bot_messages[0].id != last_message['message'].id:
+        logger.info(f"Auto-follow-up cancelled for channel {channel_id}: Bot has already sent a follow-up")
+        return
 
     logger.info(f"Generating auto-follow-up message for channel {channel_id}")
 
@@ -953,259 +1010,40 @@ def format_channel_config(config, chat_mode):
             formatted += f"**{key}:** {value}\n"
     return formatted
 
-DEFAULT_CONFIG = {
-    "image_size": "landscape_16_9",
-    "model": "fal-ai/flux-pro",
-    "num_inference_steps": 28,
-    "num_images": 1,
-    "guidance_scale": 3.5,
-    "enhance_prompt": False
-}
-
-class ConfigView(discord.ui.View):
-    def __init__(self, user_id):
-        super().__init__()
-        self.user_id = user_id
-        self.config = load_user_config(user_id)
-        self.add_item(ImageSizeSelect(self.config.get('image_size', DEFAULT_CONFIG['image_size'])))
-        self.add_item(ModelSelect(self.config.get('model', DEFAULT_CONFIG['model'])))
-
-    @discord.ui.button(label="Toggle Prompt Enhancement", style=discord.ButtonStyle.primary)
-    async def toggle_prompt_enhancement(self, interaction: discord.Interaction, button: discord.ui.Button):
-        self.config['enhance_prompt'] = not self.config.get('enhance_prompt', False)
-        status = "enabled" if self.config['enhance_prompt'] else "disabled"
-        await interaction.response.send_message(f"Prompt enhancement {status}.", ephemeral=True)
-
-    @discord.ui.button(label="Set Inference Steps", style=discord.ButtonStyle.primary)
-    async def set_inference_steps(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_modal(InferenceStepsModal(self))
-
-    @discord.ui.button(label="Set Number of Images", style=discord.ButtonStyle.primary)
-    async def set_num_images(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_modal(NumImagesModal(self))
-
-    @discord.ui.button(label="Set Guidance Scale", style=discord.ButtonStyle.primary)
-    async def set_guidance_scale(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_modal(GuidanceScaleModal(self))
-
-    @discord.ui.button(label="Save Configuration", style=discord.ButtonStyle.success)
-    async def save_config(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not all([self.config.get('image_size'), self.config.get('model'), 
-                    self.config.get('num_inference_steps'), 
-                    self.config.get('num_images'),
-                    self.config.get('guidance_scale')]):
-            await interaction.response.send_message("Please set all configuration options before saving.", ephemeral=True)
-            return
-
-        save_user_config(self.user_id, self.config)
-        await interaction.response.send_message("Configuration saved successfully!", ephemeral=True)
-        self.stop()
-
-class ImageSizeSelect(discord.ui.Select):
-    def __init__(self, default):
-        options = [
-            discord.SelectOption(label="Square HD", value="square_hd"),
-            discord.SelectOption(label="Square", value="square"),
-            discord.SelectOption(label="Portrait 4:3", value="portrait_4_3"),
-            discord.SelectOption(label="Portrait 16:9", value="portrait_16_9"),
-            discord.SelectOption(label="Landscape 4:3", value="landscape_4_3"),
-            discord.SelectOption(label="Landscape 16:9", value="landscape_16_9"),
-        ]
-        super().__init__(placeholder="Select image size", options=options)
-        self.default = default
-
-    async def callback(self, interaction: discord.Interaction):
-        await interaction.response.defer()
-        self.view.config['image_size'] = self.values[0]
-        await interaction.followup.send(f"Image size set to {self.values[0]}", ephemeral=True)
-
-class ModelSelect(discord.ui.Select):
-    def __init__(self, default):
-        options = [
-            discord.SelectOption(label="Flux Pro", value="fal-ai/flux-pro"),
-            discord.SelectOption(label="Flux Schnell", value="fal-ai/flux/schnell"),
-            discord.SelectOption(label="Flux Dev", value="fal-ai/flux/dev"),
-            discord.SelectOption(label="Flux Realism", value="fal-ai/flux-realism")
-        ]
-        super().__init__(placeholder="Select model", options=options)
-        self.default = default
-
-    async def callback(self, interaction: discord.Interaction):
-        await interaction.response.defer()
-        self.view.config['model'] = self.values[0]
-        await interaction.followup.send(f"Model set to {self.values[0]}", ephemeral=True)
-
-class InferenceStepsModal(discord.ui.Modal, title='Set Inference Steps'):
-    steps = discord.ui.TextInput(label='Inference Steps', default='28')
-
-    def __init__(self, view):
-        super().__init__()
-        self.view = view
-        self.steps.default = str(view.config.get('num_inference_steps', DEFAULT_CONFIG['num_inference_steps']))
-
-    async def on_submit(self, interaction: discord.Interaction):
-        try:
-            steps = int(self.steps.value)
-            if steps <= 0:
-                raise ValueError
-        except ValueError:
-            await interaction.response.send_message("Please enter a positive integer for inference steps.", ephemeral=True)
-            return
-
-        self.view.config['num_inference_steps'] = steps
-        await interaction.response.send_message(f"Inference steps set to {steps}.", ephemeral=True)
-
-
-class NumImagesModal(discord.ui.Modal, title='Set Number of Images'):
-    num_images = discord.ui.TextInput(label='Number of Images', default='1')
-
-    def __init__(self, view):
-        super().__init__()
-        self.view = view
-        self.num_images.default = str(view.config.get('num_images', DEFAULT_CONFIG['num_images']))
-
-    async def on_submit(self, interaction: discord.Interaction):
-        try:
-            num = int(self.num_images.value)
-            if num <= 0:
-                raise ValueError
-        except ValueError:
-            await interaction.response.send_message("Please enter a positive integer for number of images.", ephemeral=True)
-            return
-
-        self.view.config['num_images'] = num
-        await interaction.response.send_message(f"Number of images set to {num}.", ephemeral=True)
-
-class GuidanceScaleModal(discord.ui.Modal, title='Set Guidance Scale'):
-    guidance_scale = discord.ui.TextInput(label='Guidance Scale', default='3.5')
-
-    def __init__(self, view):
-        super().__init__()
-        self.view = view
-        self.guidance_scale.default = str(view.config.get('guidance_scale', DEFAULT_CONFIG['guidance_scale']))
-
-    async def on_submit(self, interaction: discord.Interaction):
-        try:
-            scale = float(self.guidance_scale.value)
-            if scale <= 0:
-                raise ValueError
-        except ValueError:
-            await interaction.response.send_message("Please enter a positive number for guidance scale.", ephemeral=True)
-            return
-
-        self.view.config['guidance_scale'] = scale
-        await interaction.response.send_message(f"Guidance scale set to {scale}.", ephemeral=True)
-
-@client.tree.command()
-async def configure_image_gen(interaction: discord.Interaction):
-    """Configure your image generation settings"""
-    if not check_permissions(interaction):
-        logger.warning(f"Permission denied for user {interaction.user.name} in {interaction.guild.name if interaction.guild else 'DM'}")
-        await interaction.response.send_message("You don't have permission to use this command.", ephemeral=True)
-        return
-
-    view = ConfigView(interaction.user.id)
-    await interaction.response.send_message("Please configure your image generation settings:", view=view, ephemeral=True)
-
-@client.tree.command()
-@app_commands.describe(prompt="The prompt for image generation")
-async def generate_image(interaction: discord.Interaction, prompt: str):
-    """Generate an image based on the provided prompt and your configuration"""
-    if not check_permissions(interaction):
-        logger.warning(f"Permission denied for user {interaction.user.name} in {interaction.guild.name if interaction.guild else 'DM'}")
-        await interaction.response.send_message("You don't have permission to use this command.", ephemeral=True)
-        return
-
-    await interaction.response.defer()
-
-    # Load user configuration
-    config = load_user_config(interaction.user.id)
-    
-    # Use default values for any missing configuration items
-    for key, default_value in DEFAULT_CONFIG.items():
-        if key not in config:
-            config[key] = default_value
-
-    # Start the image generation process in a separate task
-    client.loop.create_task(process_image_generation(interaction, prompt, config))
-
-    await interaction.followup.send("Image generation started. Please wait...")
-
-async def process_image_generation(interaction: discord.Interaction, prompt: str, config: dict):
-    try:
-        # Enhance the prompt if the option is enabled
-        if config['enhance_prompt']:
-            enhanced_prompt = await enhance_prompt(prompt)
-        else:
-            enhanced_prompt = prompt
-
-        handler = fal_client.submit(
-            config['model'],
-            arguments={
-                "prompt": enhanced_prompt,
-                "image_size": config['image_size'],
-                "num_inference_steps": config['num_inference_steps'],
-                "num_images": config['num_images'],
-                "guidance_scale": config['guidance_scale'],
-            },
-        )
-
-        result = await asyncio.to_thread(handler.get)
-
-        for i, image_info in enumerate(result['images']):
-            image_url = image_info['url']
-            async with aiohttp.ClientSession() as session:
-                async with session.get(image_url) as resp:
-                    if resp.status != 200:
-                        logger.error(f"Failed to download image {i+1}. Status: {resp.status}")
-                        await interaction.followup.send(f"An error occurred while downloading image {i+1}.")
-                        continue
-                    image_data = await resp.read()
-
-            # Open the image with PIL
-            image = Image.open(io.BytesIO(image_data))
-
-            # Create PngInfo object and add metadata
-            metadata = PngInfo()
-            metadata.add_text("Enhanced Prompt", enhanced_prompt)
-
-            # Save the image with metadata to a new bytes buffer
-            buffer = io.BytesIO()
-            image.save(buffer, format="PNG", pnginfo=metadata)
-            buffer.seek(0)
-
-            # Create Discord file object
-            file = discord.File(buffer, filename=f"generated_image_{i+1}.png")
-
-            # Send the image with a simple message
-            await interaction.followup.send(
-                content=f"Generated image {i+1} for prompt: '{prompt}'",
-                file=file
-            )
-
-        logger.info(f"Successfully generated and sent {config['num_images']} image(s) for user {interaction.user.name}")
-
-    except Exception as e:
-        logger.error(f"Error generating images: {str(e)}", exc_info=True)
-        await interaction.followup.send("An error occurred while generating the images. Please try again.")
+def sanitize_filename(prompt):
+    # Remove invalid characters (keep only alphanumerics, spaces, underscores, and hyphens)
+    sanitized = re.sub(r'[^A-Za-z0-9 _-]', '', prompt)
+    # Replace spaces with underscores
+    sanitized = sanitized.replace(' ', '_')
+    # Truncate the filename to a maximum length (e.g., 50 characters)
+    return sanitized[:40]
 
 @client.tree.command()
 @app_commands.describe(
-    image="The image to upscale (attach an image)",
-    image_url="URL of the image to upscale (if not attaching)",
-    upscaling_factor="Upscaling factor (currently only 4x is supported)",
-    overlapping_tiles="Use overlapping tiles to reduce seams (slower)",
-    checkpoint="Checkpoint to use for upscaling"
+    prompt="The prompt for image generation",
+    variant="Model variant to use",
+    width="Image width (multiple of 32, between 256 and 1440)",
+    height="Image height (multiple of 32, between 256 and 1440)",
+    steps="Number of inference steps (between 1 and 50)",
+    prompt_upscaling="Enable prompt upscaling",
+    guidance="Guidance scale (between 1.5 and 5)"
 )
-async def upscale(
-    interaction: discord.Interaction,
-    image: discord.Attachment = None,
-    image_url: str = None,
-    upscaling_factor: Literal["4"] = "4",
-    overlapping_tiles: bool = False,
-    checkpoint: Literal["v1", "v2"] = "v2"
+@app_commands.choices(variant=[
+    app_commands.Choice(name="flux-pro-1.1", value="flux-pro-1.1"),
+    app_commands.Choice(name="flux-pro", value="flux-pro"),
+    app_commands.Choice(name="flux-dev", value="flux-dev")
+])
+async def generate_image(
+    interaction: discord.Interaction, 
+    prompt: str,
+    variant: str = "flux-pro-1.1",
+    width: int = 1024,
+    height: int = 1024,
+    steps: int = 30,
+    prompt_upscaling: bool = False,
+    guidance: float = 2.5
 ):
-    """Upscale an image using auraSR"""
+    """Generate an image based on the provided prompt and parameters"""
     if not check_permissions(interaction):
         logger.warning(f"Permission denied for user {interaction.user.name} in {interaction.guild.name if interaction.guild else 'DM'}")
         await interaction.response.send_message("You don't have permission to use this command.", ephemeral=True)
@@ -1213,84 +1051,102 @@ async def upscale(
 
     await interaction.response.defer()
 
-    if not image and not image_url:
-        await interaction.followup.send("Please provide an image or an image URL.")
-        return
-
-    if image:
-        image_url = image.url
-
     try:
-        handler = fal_client.submit(
-            "fal-ai/aura-sr",
-            arguments={
-                "image_url": image_url,
-                "upscaling_factor": int(upscaling_factor),
-                "overlapping_tiles": overlapping_tiles,
-                "checkpoint": checkpoint
-            },
-        )
+        # Start the image generation process
+        image_url = await process_image_generation(prompt, variant, width, height, steps, prompt_upscaling, guidance)
+        
+        if image_url:
+            # Download the image
+            async with aiohttp.ClientSession() as session:
+                async with session.get(image_url) as resp:
+                    if resp.status != 200:
+                        await interaction.followup.send("An error occurred while downloading the generated image.")
+                        return
+                    image_data = await resp.read()
 
-        result = await asyncio.to_thread(handler.get)
+            # Sanitize the prompt to create a safe filename
+            sanitized_prompt = sanitize_filename(prompt)
 
-        upscaled_image_url = result['image']['url']
+            # Get a short string of numbers (timestamp or random number)
+            timestamp = int(time.time() * 1000) % 100000  # 5-digit timestamp
 
-        # Download the upscaled image
+            # Alternatively, use a random number
+            # random_number = random.randint(10000, 99999)  # 5-digit random number
+
+            # Append the number to the filename
+            filename = f"{sanitized_prompt}_{timestamp}.png"
+            # If using random number:
+            # filename = f"{sanitized_prompt}_{random_number}.png"
+
+            # Create a file object from the image data with the new filename
+            file = discord.File(io.BytesIO(image_data), filename=filename)
+
+            # Send the generated image
+            await interaction.followup.send(f"Generated image for prompt: '{prompt}'", file=file)
+        else:
+            await interaction.followup.send("Failed to generate the image. Please try again.")
+
+    except Exception as e:
+        logger.error(f"Error generating image: {str(e)}", exc_info=True)
+        await interaction.followup.send("An error occurred while generating the image. Please try again.")
+
+async def process_image_generation(prompt, variant, width, height, steps, prompt_upscaling, guidance):
+    try:
+        # Construct the endpoint URL based on the variant
+        endpoint_url = f'https://api.bfl.ml/v1/{variant}'
+
+        # Create the initial request without the 'variant' parameter
         async with aiohttp.ClientSession() as session:
-            async with session.get(upscaled_image_url) as resp:
-                if resp.status != 200:
-                    await interaction.followup.send("An error occurred while downloading the upscaled image.")
-                    return
-                image_data = await resp.read()
+            async with session.post(
+                endpoint_url,
+                headers={
+                    'accept': 'application/json',
+                    'x-key': BFL_API_KEY,
+                    'Content-Type': 'application/json',
+                },
+                json={
+                    'prompt': prompt,
+                    'width': width,
+                    'height': height,
+                    'steps': steps,
+                    'prompt_upscaling': prompt_upscaling,
+                    'guidance': guidance
+                }
+            ) as response:
+                request = await response.json()
 
-        # Create a file object from the image data
-        file = discord.File(BytesIO(image_data), filename="upscaled_image.png")
+        if 'id' not in request:
+            logger.error(f"Error in image generation request: {request}")
+            return None
 
-        # Send the upscaled image
-        await interaction.followup.send(f"Here's your upscaled image:", file=file)
+        request_id = request['id']
+
+        # Poll for the result
+        while True:
+            await asyncio.sleep(0.5)
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                    'https://api.bfl.ml/v1/get_result',
+                    headers={
+                        'accept': 'application/json',
+                        'x-key': BFL_API_KEY,
+                    },
+                    params={
+                        'id': request_id,
+                    }
+                ) as response:
+                    result = await response.json()
+
+            if result["status"] == "Ready":
+                return result['result']['sample']
+            elif result["status"] in ["Error", "Request Moderated", "Content Moderated"]:
+                logger.error(f"Error in image generation: {result}")
+                return None
 
     except Exception as e:
-        logger.error(f"Error upscaling image: {str(e)}", exc_info=True)
-        await interaction.followup.send("An error occurred while upscaling the image. Please try again.")
+        logger.error(f"Error in process_image_generation: {str(e)}", exc_info=True)
+        return None
 
-def save_user_config(user_id, config):
-    if not os.path.exists('user_configs'):
-        os.makedirs('user_configs')
-    
-    with open(f'user_configs/{user_id}.json', 'w') as f:
-        json.dump(config, f)
-
-def load_user_config(user_id):
-    if os.path.exists(f'user_configs/{user_id}.json'):
-        with open(f'user_configs/{user_id}.json', 'r') as f:
-            config = json.load(f)
-            # Ensure the new option is present
-            if 'enhance_prompt' not in config:
-                config['enhance_prompt'] = DEFAULT_CONFIG['enhance_prompt']
-            return config
-    return DEFAULT_CONFIG.copy()
-
-async def enhance_prompt(prompt):
-    system_message = """You are an AI assistant specializing in enhancing image generation prompts. Your task is to take a user's brief prompt and expand it into a more detailed and vivid description. Focus on adding specific details about the scene, lighting, mood, and style. Keep the enhanced prompt concise and directly usable for image generation. Provide only the enhanced prompt without any introductory text or explanations."""
-
-    user_message = f"Please enhance the following image generation prompt: {prompt}"
-
-    try:
-        response = await async_anthropic_client.messages.create(
-            model="claude-3-5-sonnet-20240620",
-            max_tokens=150,
-            temperature=0.7,
-            system=system_message,
-            messages=[
-                {"role": "user", "content": user_message}
-            ]
-        )
-        enhanced_prompt = response.content[0].text.strip()
-        return enhanced_prompt
-    except Exception as e:
-        logger.error(f"Error enhancing prompt: {str(e)}", exc_info=True)
-        return prompt  # Return the original prompt if enhancement fails
-            
 async def get_query_terms(message, chat_mode):
     config, _, auto_follow_up = await get_channel_configuration(message)
     
@@ -1355,7 +1211,6 @@ async def get_detailed_query_terms(message):
 
     # Extract terms from the response
     terms = [term.strip() for term in response.content[0].text.strip().split('\n') if term.strip()]
-    
     # Filter out any terms that are just numbers or single characters
     terms = [term for term in terms if len(term) > 1 and not term.isdigit()]
 
@@ -1470,7 +1325,7 @@ async def generate_completion_messages(
     # Construct the message array
     messages = [
         {"role": "user", "content": context_message},
-        {"role": "assistant", "content": "Thank you for providing the context. I understand that this is an incomplete picture of our whole conversation, but I will do my best to respond to your message with regards to the information provided. When I respond, I will follow both my primary and tertiary objectives."},
+        {"role": "assistant", "content": "Thank you for providing the context. I understand that this is an incomplete picture of our whole conversation, but I will do my best to respond to your message with regards to the information provided. When I respond, I will follow my primary objectives."},
         {"role": "user", "content": message.clean_content}
     ]
 
@@ -1487,18 +1342,6 @@ def format_messages(messages):
 
 async def do_nothing(*args, **kwargs):
     return ""
-
-# defines a function for handling messages.
-async def on_message(message):
-    if check_permissions(message):
-        store_message(message)
-        try:
-            if await is_command(message):
-                await handle_command(message)
-            elif await should_respond(message):
-                await respond_to_message(message)
-        except Exception as e:
-            handle_exception(e)
 
 # defines a helper function for checking if a message is a command.
 async def is_command(message):
@@ -1549,7 +1392,7 @@ async def respond_to_message(message):
                 follow_up_tasks[channel_id].cancel()
             
             # Schedule a new follow-up task with the original delay
-            delay = random.randint(5 * 60, 6 * 60 * 60)  # Random delay between 5 minutes and 6 hours
+            delay = random.randint(60, 5 * 60)  # Random delay between 5 minutes and 6 hours
             follow_up_tasks[channel_id] = asyncio.create_task(schedule_auto_follow_up(channel_id, delay))
             
             logger.info(f"Scheduled auto-follow-up for channel {channel_id} in {delay} seconds")
@@ -1710,6 +1553,7 @@ async def on_ready():
 # Add the event handlers to the client
 @client.event
 async def on_message(message):
+
     if isinstance(message.channel, discord.DMChannel):
         dm_channels[message.channel.id] = message.channel
 
