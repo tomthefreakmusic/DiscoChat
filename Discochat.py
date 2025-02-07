@@ -107,7 +107,7 @@ async_anthropic_client = AsyncAnthropic(api_key=os.environ.get("ANTHROPIC_API_KE
 # Set OpenAI client for DeepSeek
 async_openai_client = AsyncOpenAI(
     api_key=os.environ.get("DEEPSEEK_API_KEY"),
-    base_url="https://api.deepseek.com/v1"
+    base_url="https://api.deepseek.com"
 )
 
 bot_name = os.getenv("BOT_NAME")
@@ -852,7 +852,7 @@ async def update_auto_follow_up(channel, enabled):
 
     return enabled
 
-@client.tree.command()
+#@client.tree.command()
 @app_commands.describe(enabled="Enable or disable auto follow-up")
 async def toggle_auto_follow_up(interaction: discord.Interaction, enabled: bool):
     """Toggle the auto follow-up feature for this channel"""
@@ -1030,7 +1030,7 @@ def sanitize_filename(prompt):
     # Truncate the filename to a maximum length (e.g., 50 characters)
     return sanitized[:40]
 
-@client.tree.command()
+#@client.tree.command()
 @app_commands.describe(
     prompt="The prompt for image generation",
     variant="Model variant to use",
