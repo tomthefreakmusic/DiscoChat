@@ -3,7 +3,6 @@ import atexit
 import asyncio
 import codecs
 import io
-from io import BytesIO
 import json
 import logging
 from logging.handlers import RotatingFileHandler
@@ -22,7 +21,6 @@ from typing import Any, Dict, List, Literal
 import aiohttp
 from anthropic import AsyncAnthropic
 import chromadb
-from chromadb.config import Settings
 from chromadb.errors import IDAlreadyExistsError
 from chromadb.utils import embedding_functions
 import discord
@@ -32,8 +30,7 @@ from dotenv import load_dotenv
 import nltk
 from nltk.tokenize import word_tokenize
 from nltk.corpus import stopwords
-from PIL import Image
-from PIL.PngImagePlugin import PngInfo
+from openai import AsyncOpenAI
 from rake_nltk import Rake
 
 # Local imports
@@ -90,6 +87,7 @@ required_variables = [
     "DEV_NAME",
     "SERVER_WHITELIST",
     "FAL_KEY",
+    "DEEPSEEK_API_KEY",
 ]
 
 for variable in required_variables:
@@ -105,6 +103,12 @@ BFL_API_KEY = os.getenv("BFL_API_KEY")
 
 # Set Anthropic API key
 async_anthropic_client = AsyncAnthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
+
+# Set OpenAI client for DeepSeek
+async_openai_client = AsyncOpenAI(
+    api_key=os.environ.get("DEEPSEEK_API_KEY"),
+    base_url="https://api.deepseek.com/v1"
+)
 
 bot_name = os.getenv("BOT_NAME")
 assert bot_name is not None, "Environment variable BOT_NAME is not set"
@@ -134,7 +138,7 @@ else:
     os.makedirs(database_directory, exist_ok=True)
 
 # sets the model.
-model = "claude-3-5-sonnet-20240620"
+model = "claude-3-5-sonnet-latest"
 
 
 
@@ -952,7 +956,11 @@ async def get_channel_configuration(message):
             chat_mode = "Default"
             auto_follow_up = DEFAULT_AUTO_FOLLOW_UP
 
-        config = CHAT_MODE_PRESETS[chat_mode]
+        config = CHAT_MODE_PRESETS[chat_mode].copy()  # Make a copy of the preset
+        # Add default value for summary_recent_messages_length if not present
+        if "summary_recent_messages_length" not in config:
+            config["summary_recent_messages_length"] = 4000  # Default value
+
         return config, chat_mode, auto_follow_up
 
     except (IOError, ValueError, KeyError) as e:
@@ -960,7 +968,11 @@ async def get_channel_configuration(message):
         os.makedirs("./config/", exist_ok=True)
         with open(f"./config/{channel_id}.json", "w") as f:
             json.dump({"chat_mode": "Default", "auto_follow_up": DEFAULT_AUTO_FOLLOW_UP}, f)
-        return CHAT_MODE_PRESETS["Default"], "Default", DEFAULT_AUTO_FOLLOW_UP
+        
+        # Return default configuration with the missing key
+        default_config = CHAT_MODE_PRESETS["Default"].copy()
+        default_config["summary_recent_messages_length"] = 4000
+        return default_config, "Default", DEFAULT_AUTO_FOLLOW_UP
 
 async def update_channel_configuration(message, new_chat_mode):
     if new_chat_mode not in CHAT_MODE_PRESETS:
@@ -1439,6 +1451,28 @@ async def generate_mistral_response(system_message: str, messages: List[Dict[str
         logger.error(f"Error in Mistral API call: {e}", exc_info=True)
         raise
 
+async def generate_deepseek_response(system_message: str, messages: List[Dict[str, Any]], max_tokens: int, temperature: float) -> str:
+    try:
+        # Format messages for DeepSeek API
+        formatted_messages = [{"role": "system", "content": system_message}]
+        for msg in messages:
+            if msg["role"] != "system":  # Skip any system messages in the input
+                formatted_messages.append(msg)
+
+        response = await async_openai_client.chat.completions.create(
+            model="deepseek-chat",
+            messages=formatted_messages,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            stream=False
+        )
+        
+        return response.choices[0].message.content
+
+    except Exception as e:
+        logger.error(f"Error in DeepSeek API call: {e}", exc_info=True)
+        raise
+
 async def get_response(
     messages: List[Dict[str, Any]],
     system_message: str,
@@ -1482,6 +1516,26 @@ async def get_response(
             except Exception as e:
                 logger.error(f"Error using Mistral API, falling back to Claude: {e}")
                 # Fallback to Claude if Mistral fails
+                response = await async_anthropic_client.messages.create(
+                    model="claude-3-5-sonnet-20240620",
+                    max_tokens=max_response_tokens,
+                    temperature=temperature,
+                    system=system_message,
+                    messages=filtered_messages
+                )
+                logger.info(f"Token usage for get_response (Claude fallback): Input tokens: {response.usage.input_tokens}, Output tokens: {response.usage.output_tokens}")
+                response = response.content[0].text
+        elif chat_mode == "DeepSeek":
+            try:
+                response = await generate_deepseek_response(
+                    system_message,
+                    filtered_messages,
+                    max_response_tokens,
+                    temperature
+                )
+            except Exception as e:
+                logger.error(f"Error using DeepSeek API, falling back to Claude: {e}")
+                # Fallback to Claude if DeepSeek fails
                 response = await async_anthropic_client.messages.create(
                     model="claude-3-5-sonnet-20240620",
                     max_tokens=max_response_tokens,

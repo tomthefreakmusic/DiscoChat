@@ -64,9 +64,9 @@ Primary Objectives:
 - Do not make use of lists or bullet points to organize your response, even if previous messages showed you responding in this manner.
 """,
         "temperature": 0.8,
-        "summary_model": "claude-3-haiku-20240307",
+        "summary_model": "claude-3-5-haiku-latest",
         "summary_max_tokens": 1200,
-        "query_model": "claude-3-haiku-20240307"
+        "query_model": "claude-3-5-haiku-latest"
     },
     "Extended Memory Mistral": {
         "recent_messages_length": 5000,
@@ -90,9 +90,24 @@ Use this rich context to provide highly informed and contextually appropriate re
 
 If there are any inconsistencies between the summary and recent messages, prioritize the most recent information. If you're unsure about any details or need clarification, don't hesitate to ask the user. Your goal is to maintain a coherent, informed, and engaging conversation that builds upon the rich history you have access to. Respond in a conversational manner and avoid using lists unless requested.""",
         "temperature": 0.7,
-        "summary_model": "claude-3-haiku-20240307",
+        "summary_model": "claude-3-5-haiku-latest",
         "summary_max_tokens": 800,
-        "query_model": "claude-3-haiku-20240307",
+        "query_model": "claude-3-5-haiku-latest",
         "response_model": "mistral-large-latest"
+    },
+    "DeepSeek": {
+        "recent_messages_length": 4000,
+        "relevant_messages_length": 2000,
+        "sporadic_messages_length": 0,
+        "max_response_tokens": 1000,
+        "system_message": """You are a helpful AI assistant named {bot_name} powered by DeepSeek. You're engaging in a conversation on a Discord server. Your responses should be friendly, informative, and demonstrate awareness of both recent and past relevant discussions.
+
+Available context:
+1. Recent messages: You have access to the most recent messages in the conversation, up to 4000 tokens. These messages provide immediate context for the ongoing discussion.
+2. Relevant messages: You have access to semantically relevant messages from past conversations, up to 2000 tokens. These messages provide additional context related to the current topic.
+
+Use the combination of recent and relevant messages to provide more informed and contextually appropriate responses. When referencing past conversations, be clear about the time frame (e.g., "As we discussed earlier" or "In a previous conversation about this topic"). If you're unsure about the continuity of a conversation, don't hesitate to ask for clarification. Respond in a conversational manner and avoid using lists unless requested.""",
+        "temperature": 0.7,
+        "response_model": "deepseek-chat"
     }
 }

@@ -17,6 +17,7 @@ Pillow
 
 # API Clients
 mistralai  # For Mistral model support
+openai  # For DeepSeek model support
 
 # Async and HTTP
 asyncio
